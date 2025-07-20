@@ -33,44 +33,28 @@ This ensures that your phone's storage is always ready when connected and that n
 
 ## Installation
 
-1.  Clone the repository:
-    ```bash
-    git clone https://github.com/fjueic/gsconnect-mount-manager.git
-    ```
-2.  Navigate into the directory:
-    ```bash
-    cd gsconnect-mount-manager
-    ```
-3.  Make the installer executable and run it:
-    ```bash
-    chmod +x install.sh
-    ./install.sh
-    ```
+Run the following commands in your terminal:
+```bash
+git clone https://github.com/fjueic/gsconnect-mount-manager.git
+cd gsconnect-mount-manager
+chmod +x install.sh
+./install.sh
+```
 The script will be installed as a systemd user service and will start automatically.
 
 **Note:** Do NOT run the installer with `sudo` or as the root user.
 
 ## Uninstallation
 
-To completely remove the service and all related files:
-
-1.  Stop and disable the systemd service:
-    ```bash
-    systemctl --user stop gsconnect-mount-manager.service
-    systemctl --user disable gsconnect-mount-manager.service
-    ```
-2.  Remove the systemd service file:
-    ```bash
-    sudo rm /etc/systemd/user/gsconnect-mount-manager.service
-    ```
-3.  Remove the installed script and configuration files:
-    ```bash
-    rm -rf ~/.config/gsconnect-mount-manager
-    ```
-4.  (Optional) Remove the created symlink if it still exists (replace `Your_Device_Name` with the actual name):
-    ```bash
-    rm ~/Your_Device_Name
-    ```
+To completely remove the service and all related files, run the following commands. You may be prompted for your password to remove the systemd service file.
+```bash
+systemctl --user stop gsconnect-mount-manager.service
+systemctl --user disable gsconnect-mount-manager.service
+sudo rm /etc/systemd/user/gsconnect-mount-manager.service
+rm -rf ~/.config/gsconnect-mount-manager
+# Optional: Remove the symlink, replacing 'Your_Device_Name' with the actual name
+# rm ~/Your_Device_Name
+```
 
 ## Tested On
 
