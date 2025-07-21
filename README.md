@@ -58,9 +58,4 @@ rm -rf ~/.config/gsconnect-mount-manager
 
 ## Tested On
 
-- Arch Linux (Gnome)
-- Manjaro
-- Garuda Linux
-- Pop!_OS
-- Fedora
-- Ubuntu
+- Ubuntu (Gnome)
