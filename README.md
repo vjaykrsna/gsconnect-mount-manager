@@ -35,7 +35,7 @@ This ensures that your phone's storage is always ready when connected and that n
 
 Run the following commands in your terminal:
 ```bash
-git clone https://github.com/fjueic/gsconnect-mount-manager.git
+git clone https://github.com/vjaykrsna/gsconnect-mount-manager.git
 cd gsconnect-mount-manager
 chmod +x install.sh
 ./install.sh
