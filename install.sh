@@ -52,6 +52,14 @@ for file in "${required_files[@]}"; do
     fi
 done
 
+# Check if already installed
+if systemctl --user is-active gsconnect-mount-manager.service >/dev/null 2>&1; then
+    echo -e "${YELLOW}Existing installation detected. Updating...${NC}"
+    UPDATE_MODE=true
+else
+    UPDATE_MODE=false
+fi
+
 # putting files in place
 echo -e "${GREEN}Installing gsconnect-mount-manager...${NC}"
 install_dir="$USER_HOME/.config/gsconnect-mount-manager"
