@@ -99,17 +99,18 @@ load_config() {
         done < "$config_file"
     fi
     
-    # Expand variables in paths
-    MOUNT_ROOT=$(eval echo "$MOUNT_ROOT")
-    CONFIG_DIR=$(eval echo "$CONFIG_DIR")
-    BOOKMARK_FILE=$(eval echo "$BOOKMARK_FILE")
-    MOUNT_STRUCTURE_DIR=$(eval echo "$MOUNT_STRUCTURE_DIR")
+    # Expand variables in paths (safe expansion)
+    MOUNT_ROOT="${MOUNT_ROOT//\$HOME/$HOME}"
+    MOUNT_ROOT="${MOUNT_ROOT//\$(id -u)/$(id -u)}"
+    CONFIG_DIR="${CONFIG_DIR//\$HOME/$HOME}"
+    BOOKMARK_FILE="${BOOKMARK_FILE//\$HOME/$HOME}"
+    MOUNT_STRUCTURE_DIR="${MOUNT_STRUCTURE_DIR//\$HOME/$HOME}"
 
     # Set symlink directory to MOUNT_STRUCTURE_DIR if empty
     if [[ -z "$SYMLINK_DIR" ]]; then
         SYMLINK_DIR="$MOUNT_STRUCTURE_DIR"
     else
-        SYMLINK_DIR=$(eval echo "$SYMLINK_DIR")
+        SYMLINK_DIR="${SYMLINK_DIR//\$HOME/$HOME}"
     fi
     
     # Validate numeric values
@@ -212,6 +213,22 @@ load_config() {
     if ! [[ "$MAX_EXTERNAL_STORAGE" =~ ^[0-9]+$ ]] || [[ "$MAX_EXTERNAL_STORAGE" -lt 0 ]] || [[ "$MAX_EXTERNAL_STORAGE" -gt 10 ]]; then
         echo "Warning: Invalid MAX_EXTERNAL_STORAGE '$MAX_EXTERNAL_STORAGE', using default: $DEFAULT_MAX_EXTERNAL_STORAGE"
         MAX_EXTERNAL_STORAGE=$DEFAULT_MAX_EXTERNAL_STORAGE
+    fi
+
+    # Validate directory names don't contain problematic characters
+    if [[ "$INTERNAL_STORAGE_NAME" =~ [/\\] ]]; then
+        echo "Warning: INTERNAL_STORAGE_NAME contains invalid characters, using default"
+        INTERNAL_STORAGE_NAME=$DEFAULT_INTERNAL_STORAGE_NAME
+    fi
+
+    if [[ "$EXTERNAL_STORAGE_NAME" =~ [/\\] ]]; then
+        echo "Warning: EXTERNAL_STORAGE_NAME contains invalid characters, using default"
+        EXTERNAL_STORAGE_NAME=$DEFAULT_EXTERNAL_STORAGE_NAME
+    fi
+
+    if [[ "$USB_STORAGE_NAME" =~ [/\\] ]]; then
+        echo "Warning: USB_STORAGE_NAME contains invalid characters, using default"
+        USB_STORAGE_NAME=$DEFAULT_USB_STORAGE_NAME
     fi
 }
 

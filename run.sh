@@ -36,15 +36,16 @@ log_message() {
         ERROR) [[ "$level" != "ERROR" ]] && return ;;
     esac
 
-    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+    # Write to log file (plain text, no colors)
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
 
-    # Also output to console for INFO and above (unless verbose is disabled)
+    # Output to console with colors (only if not DEBUG or if VERBOSE is true)
     if [[ "$level" != "DEBUG" ]] || [[ "$VERBOSE" == true ]]; then
         case "$level" in
-            ERROR) echo -e "\033[0;31m$message\033[0m" ;;
-            WARN) echo -e "\033[1;33m$message\033[0m" ;;
-            INFO) echo -e "\033[0;32m$message\033[0m" ;;
-            DEBUG) [[ "$VERBOSE" == true ]] && echo -e "\033[0;36m$message\033[0m" ;;
+            ERROR) echo -e "\033[0;31m[$timestamp] [$level] $message\033[0m" ;;
+            WARN) echo -e "\033[1;33m[$timestamp] [$level] $message\033[0m" ;;
+            INFO) echo -e "\033[0;32m[$timestamp] [$level] $message\033[0m" ;;
+            DEBUG) [[ "$VERBOSE" == true ]] && echo -e "\033[0;36m[$timestamp] [$level] $message\033[0m" ;;
         esac
     fi
 }
@@ -52,7 +53,17 @@ log_message() {
 # Log rotation function
 rotate_logs() {
     if [[ "$MAX_LOG_SIZE" -gt 0 ]] && [[ -f "$LOG_FILE" ]]; then
-        local size_mb=$(( $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) / 1024 / 1024 ))
+        # Get file size in bytes (portable way)
+        local size_bytes
+        if command -v stat >/dev/null 2>&1; then
+            # Try GNU stat first, then BSD stat
+            size_bytes=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+        else
+            # Fallback using ls and awk
+            size_bytes=$(ls -l "$LOG_FILE" 2>/dev/null | awk '{print $5}' || echo 0)
+        fi
+
+        local size_mb=$((size_bytes / 1024 / 1024))
         if [[ "$size_mb" -gt "$MAX_LOG_SIZE" ]]; then
             for i in $(seq $((LOG_ROTATE_COUNT-1)) -1 1); do
                 [[ -f "$LOG_FILE.$i" ]] && mv "$LOG_FILE.$i" "$LOG_FILE.$((i+1))"
@@ -77,8 +88,20 @@ get_device_name() {
 
     log_message "DEBUG" "Looking for device with host IP: $host"
 
+    # Check if dconf is available
+    if ! command -v dconf >/dev/null 2>&1; then
+        log_message "ERROR" "dconf command not found. GSConnect may not be installed."
+        return 1
+    fi
+
     # Find the device ID that matches the host IP
-    for dev_id in $(dconf list /org/gnome/shell/extensions/gsconnect/device/ | grep '/$'); do
+    local device_list
+    if ! device_list=$(dconf list /org/gnome/shell/extensions/gsconnect/device/ 2>/dev/null); then
+        log_message "ERROR" "Cannot access GSConnect device list. GSConnect may not be configured."
+        return 1
+    fi
+
+    for dev_id in $(echo "$device_list" | grep '/$'); do
         local full_path="/org/gnome/shell/extensions/gsconnect/device/${dev_id}"
         local last_conn_ip=$(dconf read "${full_path}last-connection" 2>/dev/null | tr -d "'" | sed -n 's/lan:\/\/\([^:]*\):.*/\1/p')
 
@@ -88,66 +111,62 @@ get_device_name() {
             local device_name=$(dconf read "${full_path}name" 2>/dev/null | tr -d "'")
             log_message "DEBUG" "Found matching device: $device_name"
             echo "$device_name"
-            return
+            return 0
         fi
     done
 
     log_message "WARN" "No matching device found for host $host"
+    return 1
 }
 
 # Function to sanitize device name for filesystem use
 sanitize_device_name() {
     local device_name="$1"
+
+    # Handle empty device name
+    if [[ -z "$device_name" ]]; then
+        echo "Unknown-Device"
+        return
+    fi
+
     # Replace spaces with hyphens and remove other problematic characters
     local sanitized=$(echo "$device_name" | sed 's/ /-/g' | sed 's/[^a-zA-Z0-9._-]//g')
+
+    # Ensure we have at least something after sanitization
+    if [[ -z "$sanitized" ]]; then
+        sanitized="Unknown-Device"
+    fi
+
     echo "$sanitized"
 }
 
-# Function to create symlink with custom naming
-create_symlink() {
-    local device_name="$1"
-    local target_path="$2"
 
-    # Apply prefix and suffix
-    local link_name="${SYMLINK_PREFIX}${device_name}${SYMLINK_SUFFIX}"
-    local link_path="$SYMLINK_DIR/$link_name"
-
-    # Remove existing symlink if it exists
-    if [[ -L "$link_path" ]]; then
-        rm "$link_path"
-        log_message "DEBUG" "Removed existing symlink: $link_path"
-    elif [[ -e "$link_path" ]]; then
-        log_message "ERROR" "Cannot create symlink: $link_path already exists and is not a symlink"
-        return 1
-    fi
-
-    # Create the symlink
-    if ln -s "$target_path" "$link_path"; then
-        echo "$link_path" > "$LINK_PATH_FILE"
-        log_message "INFO" "🔗 Symlink created: $link_path"
-        send_notification "Device mounted: $device_name\nSymlink: $link_path"
-        return 0
-    else
-        log_message "ERROR" "Failed to create symlink: $link_path"
-        return 1
-    fi
-}
 
 # Function to cleanup broken symlinks
 cleanup_broken_symlinks() {
     if [[ "$AUTO_CLEANUP" == true ]] && [[ -d "$MOUNT_STRUCTURE_DIR" ]]; then
         log_message "DEBUG" "Checking for broken symlinks in $MOUNT_STRUCTURE_DIR"
 
-        # Find broken symlinks in device directories
-        find "$MOUNT_STRUCTURE_DIR" -type l ! -exec test -e {} \; -print 2>/dev/null | while read -r broken_link; do
-            rm "$broken_link"
-            log_message "INFO" "Cleaned up broken symlink: $broken_link"
+        # Find broken symlinks in device directories (avoid subshell)
+        local broken_links
+        mapfile -t broken_links < <(find "$MOUNT_STRUCTURE_DIR" -type l ! -exec test -e {} \; -print 2>/dev/null)
+
+        for broken_link in "${broken_links[@]}"; do
+            if [[ -n "$broken_link" ]]; then
+                rm "$broken_link"
+                log_message "INFO" "Cleaned up broken symlink: $broken_link"
+            fi
         done
 
-        # Remove empty device directories
-        find "$MOUNT_STRUCTURE_DIR" -mindepth 1 -maxdepth 1 -type d -empty -print 2>/dev/null | while read -r empty_dir; do
-            rmdir "$empty_dir"
-            log_message "INFO" "Cleaned up empty device directory: $(basename "$empty_dir")"
+        # Remove empty device directories (avoid subshell)
+        local empty_dirs
+        mapfile -t empty_dirs < <(find "$MOUNT_STRUCTURE_DIR" -mindepth 1 -maxdepth 1 -type d -empty -print 2>/dev/null)
+
+        for empty_dir in "${empty_dirs[@]}"; do
+            if [[ -n "$empty_dir" ]]; then
+                rmdir "$empty_dir"
+                log_message "INFO" "Cleaned up empty device directory: $(basename "$empty_dir")"
+            fi
         done
     fi
 }
@@ -180,29 +199,37 @@ discover_storage_paths() {
             IFS=' ' read -ra patterns <<< "$EXTERNAL_STORAGE_PATTERNS"
 
             for pattern in "${patterns[@]}"; do
+                # Stop if we've reached the maximum
+                if [[ $external_count -ge $MAX_EXTERNAL_STORAGE ]]; then
+                    break
+                fi
+
                 # Handle glob patterns
                 if [[ "$pattern" == *"*"* ]]; then
-                    # Use find for glob patterns
-                    while IFS= read -r -d '' external_path; do
-                        if [[ -d "$external_path" ]] && [[ $external_count -lt $MAX_EXTERNAL_STORAGE ]]; then
+                    # Use find for glob patterns (limit depth for performance)
+                    local found_paths
+                    mapfile -t found_paths < <(find "$storage_dir" -maxdepth 1 -type d -name "${pattern##*/}" -print 2>/dev/null)
+
+                    for external_path in "${found_paths[@]}"; do
+                        if [[ -n "$external_path" ]] && [[ -d "$external_path" ]] && [[ $external_count -lt $MAX_EXTERNAL_STORAGE ]]; then
                             storage_paths+=("external:$external_path")
                             log_message "DEBUG" "Found external storage: $external_path"
                             ((external_count++))
                         fi
-                    done < <(find "$mount_point" -maxdepth 2 -type d -path "*/$pattern" -print0 2>/dev/null)
+
+                        # Stop if we've reached the maximum
+                        if [[ $external_count -ge $MAX_EXTERNAL_STORAGE ]]; then
+                            break
+                        fi
+                    done
                 else
-                    # Direct path check
+                    # Direct path check (faster)
                     local external_path="$mount_point/$pattern"
                     if [[ -d "$external_path" ]] && [[ $external_count -lt $MAX_EXTERNAL_STORAGE ]]; then
                         storage_paths+=("external:$external_path")
                         log_message "DEBUG" "Found external storage: $external_path"
                         ((external_count++))
                     fi
-                fi
-
-                # Stop if we've reached the maximum
-                if [[ $external_count -ge $MAX_EXTERNAL_STORAGE ]]; then
-                    break
                 fi
             done
 
@@ -214,8 +241,10 @@ discover_storage_paths() {
         fi
     fi
 
-    # Return the discovered paths
-    printf '%s\n' "${storage_paths[@]}"
+    # Return the discovered paths (handle empty array safely)
+    if [[ ${#storage_paths[@]} -gt 0 ]]; then
+        printf '%s\n' "${storage_paths[@]}"
+    fi
 }
 
 # Function to create storage symlink within device directory
@@ -312,7 +341,7 @@ while true; do
     if [[ -n "$MNT" ]] && ! [[ -f "$FLAG_FILE" ]]; then
         # Mounted and not flagged -> run mount logic
         log_message "INFO" "Mount detected: $(basename "$MNT")"
-        DEVICE_NAME=$(get_device_name "$(basename "$MNT")")
+        DEVICE_NAME=$(get_device_name "$(basename "$MNT")") || true
 
         if [[ -z "$DEVICE_NAME" ]]; then
             log_message "WARN" "Could not determine device name, using mount path"

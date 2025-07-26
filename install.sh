@@ -37,15 +37,20 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 # Get home directory of user
-if [ "$(id -u)" -eq 0 ]; then
-  USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-else
-  USER_HOME=$(getent passwd "$USER" | cut -d: -f6)
-fi
+USER_HOME="$HOME"
 
 # changing directory to the script directory
 script_dir=$(dirname "$0")
 cd "$script_dir" || exit # Exit the script if cd doesn't work, prevents following commands from running
+
+# Check if required files exist
+required_files=("run.sh" "config_loader.sh" "config.conf")
+for file in "${required_files[@]}"; do
+    if [[ ! -f "$file" ]]; then
+        echo -e "${RED}Error: Required file '$file' not found${NC}"
+        exit 1
+    fi
+done
 
 # putting files in place
 echo -e "${GREEN}Installing gsconnect-mount-manager...${NC}"
@@ -85,7 +90,13 @@ EOF
 echo -e "${GREEN}Reloading and starting the gsconnect-mount-manager service...${NC}"
 systemctl --user daemon-reload
 systemctl --user enable gsconnect-mount-manager.service
-systemctl --user restart gsconnect-mount-manager.service
+
+# Use start instead of restart for new installations
+if systemctl --user is-active gsconnect-mount-manager.service >/dev/null 2>&1; then
+    systemctl --user restart gsconnect-mount-manager.service
+else
+    systemctl --user start gsconnect-mount-manager.service
+fi
 
 echo
 echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
