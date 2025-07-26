@@ -58,14 +58,18 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The script installs as a systemd user service and starts automatically with these defaults:
-- **📁 Single Bookmark**: One bookmark per device showing all storage as subfolders
-- **🔗 Smart Symlinks**: Separate symlinks for internal storage and each SD card
-- **🔔 Notifications**: Desktop notifications when devices mount/unmount
-- **📊 Logging**: INFO level with automatic log rotation
-- **⚡ Polling**: Checks for device changes every 5 seconds
+The script installs as a systemd user service and starts automatically.
 
 **Note:** Do NOT run the installer with `sudo` or as the root user.
+
+## Updating
+
+To update to the latest version, run the `update.sh` script:
+```bash
+cd gsconnect-mount-manager
+./update.sh
+```
+This will pull the latest changes from the repository and reinstall the service.
 
 ## Requirements
 
@@ -81,30 +85,35 @@ Edit the configuration file to customize behavior:
 nano ~/.config/gsconnect-mount-manager/config.conf
 ```
 
-**Common Settings:**
-```bash
-# Change polling frequency (1-60 seconds)
-POLL_INTERVAL=10
-
-# Custom mount directory
-MOUNT_STRUCTURE_DIR="$HOME/Devices"
-
-# Custom naming
-SYMLINK_PREFIX="Phone-"
-EXTERNAL_STORAGE_NAME="SDCard"
-USB_STORAGE_NAME="USB-OTG"
-
-# Disable notifications
-ENABLE_NOTIFICATIONS=false
-
-# More verbose logging
-LOG_LEVEL=DEBUG
-```
-
 After editing, restart the service:
 ```bash
 systemctl --user restart gsconnect-mount-manager
 ```
+
+### General Settings
+- `POLL_INTERVAL`: How often to check for device connections (seconds).
+- `MOUNT_STRUCTURE_DIR`: Where to create device folders (e.g., `~/Devices`).
+- `ENABLE_NOTIFICATIONS`: `true` or `false` to control desktop alerts.
+
+### Naming & Symlinks
+- `SYMLINK_PREFIX` / `SYMLINK_SUFFIX`: Add text before/after the device name in bookmarks.
+- `INTERNAL_STORAGE_NAME`: Folder name for internal storage (default: `Internal`).
+- `EXTERNAL_STORAGE_NAME`: Base name for SD cards (default: `SDCard`).
+- `USB_STORAGE_NAME`: Base name for USB-OTG devices (default: `USB-OTG`).
+
+### Storage Detection
+- `ENABLE_INTERNAL_STORAGE`: `true` to mount internal storage.
+- `ENABLE_EXTERNAL_STORAGE`: `true` to detect and mount SD cards/USB.
+- `INTERNAL_STORAGE_PATH`: Path to internal storage on the device.
+- `EXTERNAL_STORAGE_PATTERNS`: Space-separated patterns to find external storage (e.g., `storage/sdcard1 storage/*[0-9A-F]`).
+- `MAX_EXTERNAL_STORAGE`: Maximum number of external drives to mount.
+- `STORAGE_TIMEOUT`: How long to wait for storage to appear after connection (seconds).
+
+### Logging & Cleanup
+- `LOG_LEVEL`: `DEBUG`, `INFO`, `WARN`, `ERROR`.
+- `MAX_LOG_SIZE`: Max log file size in MB before rotation.
+- `LOG_ROTATE_COUNT`: How many old log files to keep.
+- `AUTO_CLEANUP`: `true` to automatically remove broken symlinks from previous sessions.
 
 ## Management Commands
 
@@ -122,12 +131,12 @@ systemctl --user start gsconnect-mount-manager
 
 ## Uninstallation
 
+The provided `uninstall.sh` script will stop the service, remove all installed files, and clean up bookmarks.
+
 ```bash
-systemctl --user stop gsconnect-mount-manager.service
-systemctl --user disable gsconnect-mount-manager.service
-rm ~/.config/systemd/user/gsconnect-mount-manager.service
-rm -rf ~/.config/gsconnect-mount-manager
-rm -rf ~/.gsconnect-mount
+cd gsconnect-mount-manager
+chmod +x uninstall.sh
+./uninstall.sh
 ```
 
 ## Troubleshooting
