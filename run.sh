@@ -95,6 +95,14 @@ get_device_name() {
     log_message "WARN" "No matching device found for host $host"
 }
 
+# Function to sanitize device name for filesystem use
+sanitize_device_name() {
+    local device_name="$1"
+    # Replace spaces with hyphens and remove other problematic characters
+    local sanitized=$(echo "$device_name" | sed 's/ /-/g' | sed 's/[^a-zA-Z0-9._-]//g')
+    echo "$sanitized"
+}
+
 # Function to create symlink with custom naming
 create_symlink() {
     local device_name="$1"
@@ -127,13 +135,19 @@ create_symlink() {
 
 # Function to cleanup broken symlinks
 cleanup_broken_symlinks() {
-    if [[ "$AUTO_CLEANUP" == true ]]; then
-        log_message "DEBUG" "Checking for broken symlinks in $SYMLINK_DIR"
-        find "$SYMLINK_DIR" -maxdepth 1 -type l ! -exec test -e {} \; -print 2>/dev/null | while read -r broken_link; do
-            if [[ "$broken_link" =~ $SYMLINK_PREFIX.*($SYMLINK_SUFFIX|$INTERNAL_STORAGE_SUFFIX|$EXTERNAL_STORAGE_SUFFIX)$ ]]; then
-                rm "$broken_link"
-                log_message "INFO" "Cleaned up broken symlink: $broken_link"
-            fi
+    if [[ "$AUTO_CLEANUP" == true ]] && [[ -d "$MOUNT_STRUCTURE_DIR" ]]; then
+        log_message "DEBUG" "Checking for broken symlinks in $MOUNT_STRUCTURE_DIR"
+
+        # Find broken symlinks in device directories
+        find "$MOUNT_STRUCTURE_DIR" -type l ! -exec test -e {} \; -print 2>/dev/null | while read -r broken_link; do
+            rm "$broken_link"
+            log_message "INFO" "Cleaned up broken symlink: $broken_link"
+        done
+
+        # Remove empty device directories
+        find "$MOUNT_STRUCTURE_DIR" -mindepth 1 -maxdepth 1 -type d -empty -print 2>/dev/null | while read -r empty_dir; do
+            rmdir "$empty_dir"
+            log_message "INFO" "Cleaned up empty device directory: $(basename "$empty_dir")"
         done
     fi
 }
@@ -204,30 +218,34 @@ discover_storage_paths() {
     printf '%s\n' "${storage_paths[@]}"
 }
 
-# Function to create storage-specific symlink
+# Function to create storage symlink within device directory
 create_storage_symlink() {
-    local device_name="$1"
-    local storage_type="$2"  # "internal" or "external"
+    local device_dir="$1"
+    local storage_type="$2"  # "internal", "external", or "usb"
     local target_path="$3"
     local storage_index="${4:-}"  # For multiple external storage
 
-    # Determine suffix based on storage type
-    local suffix=""
+    # Determine folder name based on storage type
+    local folder_name=""
     case "$storage_type" in
         internal)
-            suffix="$INTERNAL_STORAGE_SUFFIX"
+            folder_name="$INTERNAL_STORAGE_NAME"
             ;;
         external)
-            suffix="$EXTERNAL_STORAGE_SUFFIX"
+            folder_name="$EXTERNAL_STORAGE_NAME"
             if [[ -n "$storage_index" ]] && [[ "$storage_index" -gt 1 ]]; then
-                suffix="${suffix}${storage_index}"
+                folder_name="${folder_name}${storage_index}"
+            fi
+            ;;
+        usb)
+            folder_name="$USB_STORAGE_NAME"
+            if [[ -n "$storage_index" ]] && [[ "$storage_index" -gt 1 ]]; then
+                folder_name="${folder_name}${storage_index}"
             fi
             ;;
     esac
 
-    # Apply prefix and suffix
-    local link_name="${SYMLINK_PREFIX}${device_name}${suffix}"
-    local link_path="$SYMLINK_DIR/$link_name"
+    local link_path="$device_dir/$folder_name"
 
     # Remove existing symlink if it exists
     if [[ -L "$link_path" ]]; then
@@ -241,7 +259,7 @@ create_storage_symlink() {
     # Create the symlink
     if ln -s "$target_path" "$link_path"; then
         echo "$link_path" >> "$LINK_PATH_FILE"
-        log_message "INFO" "🔗 ${storage_type^} storage symlink created: $link_path"
+        log_message "INFO" "🔗 ${storage_type^} storage linked: $folder_name → $(basename "$target_path")"
         return 0
     else
         log_message "ERROR" "Failed to create symlink: $link_path"
@@ -249,23 +267,31 @@ create_storage_symlink() {
     fi
 }
 
-# Function to create single hierarchical bookmark for device
-create_device_bookmark() {
-    local device_name="$1"
-    local mount_point="$2"
+# Function to create device directory structure and bookmark
+create_device_structure() {
+    local device_name_display="$1"
+    local device_name_sanitized="$2"
+    local mount_point="$3"
 
-    local label="${SYMLINK_PREFIX}${device_name}${SYMLINK_SUFFIX}"
-    local entry="file://$mount_point $label"
+    # Create device directory using sanitized name
+    local device_dir="$MOUNT_STRUCTURE_DIR/${device_name_sanitized}"
+    mkdir -p "$device_dir"
+
+    # Create bookmark pointing to accessible device directory using display name
+    local label="${SYMLINK_PREFIX}${device_name_display}${SYMLINK_SUFFIX}"
+    local entry="file://$device_dir $label"
 
     if ! grep -qxF "$entry" "$BOOKMARK_FILE" 2>/dev/null; then
         mkdir -p "$(dirname "$BOOKMARK_FILE")"
         echo "$entry" >> "$BOOKMARK_FILE"
         echo "$entry" > "$BOOKMARK_ENTRY_FILE"
-        log_message "INFO" "🔖 Device bookmark added: $label"
-        log_message "DEBUG" "Bookmark points to: $mount_point (shows internal storage, SD cards, etc. as subfolders)"
+        log_message "INFO" "🔖 Device bookmark added: $label" >&2
+        log_message "DEBUG" "Bookmark points to accessible directory: $device_dir" >&2
     else
-        log_message "DEBUG" "Bookmark already exists: $label"
+        log_message "DEBUG" "Bookmark already exists: $label" >&2
     fi
+
+    echo "$device_dir"
 }
 
 
@@ -293,7 +319,10 @@ while true; do
             DEVICE_NAME=$(basename "$MNT" | sed 's/sftp:host=\([^,]*\).*/\1/')
         fi
 
-        log_message "INFO" "Device name: '$DEVICE_NAME'"
+        # Sanitize device name for filesystem use
+        DEVICE_NAME_SANITIZED=$(sanitize_device_name "$DEVICE_NAME")
+
+        log_message "INFO" "Device name: '$DEVICE_NAME' (sanitized: '$DEVICE_NAME_SANITIZED')"
 
         # Wait for mount point to stabilize
         timeout_count=0
@@ -325,34 +354,44 @@ while true; do
         > "$BOOKMARK_ENTRY_FILE"
         > "$LINK_PATH_FILE"
 
-        # Create single hierarchical bookmark pointing to device root
-        create_device_bookmark "$DEVICE_NAME" "$MNT"
+        # Create device directory structure and bookmark
+        device_dir=$(create_device_structure "$DEVICE_NAME" "$DEVICE_NAME_SANITIZED" "$MNT")
 
-        # Process each discovered storage path for symlinks
-        local external_count=1
-        local success_count=0
-        local storage_summary=()
+        # Process each discovered storage path
+        external_count=1
+        usb_count=1
+        success_count=0
+        storage_summary=()
 
         for storage_info in "${storage_paths[@]}"; do
-            local storage_type="${storage_info%%:*}"
-            local storage_path="${storage_info#*:}"
-            local storage_index=""
+            storage_type="${storage_info%%:*}"
+            storage_path="${storage_info#*:}"
+            storage_index=""
 
-            # For external storage, assign index if multiple
+            # Determine storage type and index
             if [[ "$storage_type" == "external" ]]; then
-                storage_index="$external_count"
-                ((external_count++))
+                # Check if it's USB OTG
+                if [[ "$storage_path" == *"usbotg"* ]]; then
+                    storage_type="usb"
+                    storage_index="$usb_count"
+                    ((usb_count++))
+                else
+                    storage_index="$external_count"
+                    ((external_count++))
+                fi
             fi
 
             log_message "DEBUG" "Processing $storage_type storage: $storage_path"
 
-            # Create symlink for this storage
-            if create_storage_symlink "$DEVICE_NAME" "$storage_type" "$storage_path" "$storage_index"; then
+            # Create symlink within device directory
+            if create_storage_symlink "$device_dir" "$storage_type" "$storage_path" "$storage_index"; then
                 ((success_count++))
 
                 # Add to summary for notification
-                local storage_label="$storage_type"
+                storage_label="$storage_type"
                 if [[ "$storage_type" == "external" ]] && [[ -n "$storage_index" ]] && [[ "$storage_index" -gt 1 ]]; then
+                    storage_label="$storage_type $storage_index"
+                elif [[ "$storage_type" == "usb" ]] && [[ -n "$storage_index" ]] && [[ "$storage_index" -gt 1 ]]; then
                     storage_label="$storage_type $storage_index"
                 fi
                 storage_summary+=("${storage_label}: $(basename "$storage_path")")
@@ -362,11 +401,12 @@ while true; do
         if [[ $success_count -gt 0 ]]; then
             touch "$FLAG_FILE"
             log_message "INFO" "✅ Mount setup complete for: $DEVICE_NAME ($success_count storage path(s))"
+            log_message "INFO" "📁 Device folder: $device_dir"
 
             # Send consolidated notification
-            local notification_text="Device mounted: $DEVICE_NAME\n"
-            notification_text+="📁 Bookmark: Browse all storage in file manager\n"
-            notification_text+="🔗 Symlinks: $(printf '%s, ' "${storage_summary[@]}" | sed 's/, $//')"
+            notification_text="Device mounted: $DEVICE_NAME\n"
+            notification_text+="📁 Folder: $DEVICE_NAME_SANITIZED\n"
+            notification_text+="🔗 Storage: $(printf '%s, ' "${storage_summary[@]}" | sed 's/, $//')"
             send_notification "$notification_text"
         else
             log_message "ERROR" "Failed to create any symlinks, skipping flag creation"
@@ -386,26 +426,38 @@ while true; do
             rm "$BOOKMARK_ENTRY_FILE"
         fi
 
-        # Remove symlinks
+        # Remove symlinks and device directory
         if [[ -f "$LINK_PATH_FILE" ]]; then
-            local symlink_count=0
-            local device_name=""
+            symlink_count=0
+            device_dir=""
+            device_name=""
 
             while IFS= read -r link_to_remove; do
                 if [[ -n "$link_to_remove" ]] && [[ -L "$link_to_remove" ]]; then
-                    # Extract device name from first symlink (for notification)
-                    if [[ -z "$device_name" ]]; then
-                        device_name=$(basename "$link_to_remove" | sed "s/^$SYMLINK_PREFIX//; s/$SYMLINK_SUFFIX$//; s/$INTERNAL_STORAGE_SUFFIX$//; s/$EXTERNAL_STORAGE_SUFFIX[0-9]*$//")
+                    # Extract device directory from first symlink
+                    if [[ -z "$device_dir" ]]; then
+                        device_dir=$(dirname "$link_to_remove")
+                        device_name=$(basename "$device_dir")
                     fi
 
                     rm "$link_to_remove"
-                    log_message "INFO" "🔗 Symlink removed: $link_to_remove"
+                    log_message "INFO" "🔗 Storage symlink removed: $(basename "$link_to_remove")"
                     ((symlink_count++))
                 fi
             done < "$LINK_PATH_FILE"
 
+            # Remove device directory if it exists and is empty
+            if [[ -n "$device_dir" ]] && [[ -d "$device_dir" ]]; then
+                # Remove directory if empty
+                if rmdir "$device_dir" 2>/dev/null; then
+                    log_message "INFO" "📁 Device directory removed: $device_dir"
+                else
+                    log_message "WARN" "Device directory not empty, keeping: $device_dir"
+                fi
+            fi
+
             if [[ $symlink_count -gt 0 ]]; then
-                log_message "INFO" "Removed $symlink_count symlink(s)"
+                log_message "INFO" "Removed $symlink_count storage symlink(s)"
                 if [[ -n "$device_name" ]]; then
                     send_notification "Device unmounted: $device_name\n$symlink_count storage path(s) disconnected"
                 fi

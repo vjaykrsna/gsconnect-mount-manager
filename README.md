@@ -1,79 +1,55 @@
 # GSConnect Mount Manager
 
-A simple, robust script to automatically manage your phone's storage via GSConnect. This script runs as a lightweight background service to automatically handle mounting and unmounting your device's storage.
-
-## Problem Solved
-
-This script provides a seamless solution to the issue where accessing GSConnect's mounted storage directly can be cumbersome or result in folders opening in new windows.
+Automatically organize and access your Android device storage when connected via GSConnect. Creates clean bookmarks and symlinks for seamless file browsing.
 
 ![error](./error.png)
 
 ## Features
 
-- **Automatic Mounting:** Detects when your phone connects via GSConnect and automatically prepares the storage.
-- **Automatic Unmounting:** Detects when your phone disconnects and cleans up the created links and bookmarks.
-- **Dynamic Naming:** Automatically uses your device's name for bookmarks and symlinks (e.g., a bookmark and symlink named "MyPhone").
-- **Nautilus Bookmark:** Creates a bookmark in your file manager for easy, one-click access.
-- **CLI Symlink:** Creates a symlink in your home directory for quick terminal access.
-- **Multi-Storage Support:** Automatically detects and mounts both internal storage and external storage (SD cards, USB OTG).
-- **Customizable Configuration:** Advanced installation mode with configurable paths, polling intervals, and naming schemes.
-- **Desktop Notifications:** Optional notifications when devices mount/unmount with storage-specific details.
-- **Structured Logging:** Configurable log levels with automatic log rotation.
-- **Error Recovery:** Robust error handling and automatic cleanup of broken symlinks.
-- **Lightweight & Efficient:** Runs as a minimal background service with negligible resource usage.
-- **Safe & Non-Intrusive:** Does not modify any GSConnect files, ensuring stability and compatibility with future GSConnect updates.
+- **🔄 Auto Mount/Unmount**: Detects device connections and handles setup/cleanup automatically
+- **📁 Clean Organization**: Creates `~/.gsconnect-mount/Device-Name/` with organized storage folders  
+- **🔖 File Manager Integration**: Single bookmark per device showing all storage types as subfolders
+- **💻 Terminal Access**: Direct symlinks to internal storage and SD cards
+- **📱 Multi-Storage Support**: Handles internal storage, SD cards, and USB OTG devices
+- **🔔 Smart Notifications**: Desktop alerts when devices mount/unmount
+- **⚙️ Configurable**: Customizable via config file (polling, paths, naming, etc.)
+- **🛡️ Safe & Reliable**: No GSConnect modifications, automatic error recovery
 
 ## How It Works
 
-The script runs as a systemd user service, continuously monitoring for a GSConnect SFTP mount in the background.
+**When your phone connects:**
+1. 🔍 Detects GSConnect SFTP mount
+2. 📁 Creates `~/.gsconnect-mount/Device-Name/` directory
+3. 🔗 Creates symlinks: `Internal/`, `SDCard/`, `USB-OTG/` (as available)
+4. 🔖 Adds bookmark to file manager sidebar
+5. 🔔 Shows desktop notification
 
-- **On Mount:** When a device connects, the script automatically creates a bookmark in Nautilus and a symlink in your home directory for easy access.
-- **On Unmount:** When the device disconnects, the script cleans up by removing the previously created bookmark and symlink.
+**When your phone disconnects:**
+- 🧹 Automatically cleans up all symlinks and bookmarks
+- 📂 Removes empty device directories
 
-This ensures that your phone's storage is always ready when connected and that no stale links are left behind when it's not.
+## Storage Organization
 
-## Multi-Storage Support
-
-The system automatically detects and provides access to multiple storage types:
-
-### Internal Storage
-- **Path**: `storage/emulated/0` (Android's internal storage)
-- **Symlink**: `DeviceName` (or with custom suffix)
-- **Contains**: Apps, photos, downloads, documents
-
-### External Storage (SD Cards, USB OTG)
-- **Auto-Detection**: Scans for SD cards and USB devices
-- **Symlink**: `DeviceName-SDCard` (or custom suffix)
-- **Multiple Devices**: Supports up to 10 external storage devices
-- **Smart Naming**: Automatically numbers multiple devices (SDCard, SDCard2, etc.)
-
-### Example Setup
-When your phone "MyPhone" connects with an SD card:
-
-**Single Bookmark Created:**
-- `MyPhone` → Opens device root showing:
-  - `storage/emulated/0/` (internal storage)
-  - `storage/1234-5678/` (SD card)
-  - Any other connected storage
-
-**Symlinks Created:**
-```bash
-~/MyPhone          → internal storage (photos, apps, downloads)
-~/MyPhone-SDCard   → SD card (additional storage)
+```
+~/.gsconnect-mount/
+└── IQOO-Z9x-5G/              # Device folder (spaces → hyphens)
+    ├── Internal/              # → Android internal storage
+    ├── SDCard/                # → SD card (if present)
+    └── USB-OTG/               # → USB OTG device (if present)
 ```
 
-**User Experience:**
-- 📁 **File Manager**: Click "MyPhone" bookmark → browse all storage in one place
-- 💻 **Terminal**: Use `~/MyPhone` or `~/MyPhone-SDCard` for direct access
-- 🔔 **Notifications**: Get notified when storage mounts/unmounts
+**File Manager Experience:**
+- Click "iQOO Z9x 5G" bookmark → Opens device folder
+- See `Internal/`, `SDCard/` folders → Click to browse storage
+- Natural folder navigation, no complex paths
 
-## Requirements
-
-- A working GSConnect installation on your GNOME desktop.
+**Terminal Access:**
+```bash
+cd ~/.gsconnect-mount/IQOO-Z9x-5G/Internal    # Phone storage
+cd ~/.gsconnect-mount/IQOO-Z9x-5G/SDCard      # SD card
+```
 
 ## Installation
-
-Run the following commands in your terminal:
 
 ```bash
 git clone https://github.com/vjaykrsna/gsconnect-mount-manager.git
@@ -82,9 +58,8 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The script will be installed as a systemd user service and will start automatically with these default settings:
-
-- **📁 Single Bookmark**: One bookmark per device that shows internal storage, SD cards, etc. as subfolders
+The script installs as a systemd user service and starts automatically with these defaults:
+- **📁 Single Bookmark**: One bookmark per device showing all storage as subfolders
 - **🔗 Smart Symlinks**: Separate symlinks for internal storage and each SD card
 - **🔔 Notifications**: Desktop notifications when devices mount/unmount
 - **📊 Logging**: INFO level with automatic log rotation
@@ -92,37 +67,37 @@ The script will be installed as a systemd user service and will start automatica
 
 **Note:** Do NOT run the installer with `sudo` or as the root user.
 
+## Requirements
+
+- **GSConnect**: GNOME Shell extension for KDE Connect protocol
+- **GNOME/GTK Environment**: For bookmark integration
+- **systemd**: For service management
+- **Android Device**: With KDE Connect app installed
+
 ## Customization
 
-To customize settings, edit the configuration file:
+Edit the configuration file to customize behavior:
 ```bash
 nano ~/.config/gsconnect-mount-manager/config.conf
 ```
 
-**Common Customizations:**
-
+**Common Settings:**
 ```bash
 # Change polling frequency (1-60 seconds)
 POLL_INTERVAL=10
 
-# Custom symlink location
-SYMLINK_DIR="/home/user/Devices"
+# Custom mount directory
+MOUNT_STRUCTURE_DIR="$HOME/Devices"
 
 # Custom naming
 SYMLINK_PREFIX="Phone-"
-EXTERNAL_STORAGE_SUFFIX="-SD"
+EXTERNAL_STORAGE_NAME="SD-Card"
 
 # Disable notifications
 ENABLE_NOTIFICATIONS=false
 
 # More verbose logging
 LOG_LEVEL=DEBUG
-VERBOSE=true
-
-# Storage options
-ENABLE_INTERNAL_STORAGE=true
-ENABLE_EXTERNAL_STORAGE=true
-MAX_EXTERNAL_STORAGE=5
 ```
 
 After editing, restart the service:
@@ -132,34 +107,51 @@ systemctl --user restart gsconnect-mount-manager
 
 ## Management Commands
 
-Check service status:
 ```bash
+# Check service status
 systemctl --user status gsconnect-mount-manager
-```
 
-View live logs:
-```bash
+# View live logs
 journalctl --user -u gsconnect-mount-manager -f
-```
 
-Stop/start the service:
-```bash
+# Stop/start the service
 systemctl --user stop gsconnect-mount-manager
 systemctl --user start gsconnect-mount-manager
 ```
 
 ## Uninstallation
 
-To completely remove the service and all related files:
 ```bash
 systemctl --user stop gsconnect-mount-manager.service
 systemctl --user disable gsconnect-mount-manager.service
 rm ~/.config/systemd/user/gsconnect-mount-manager.service
 rm -rf ~/.config/gsconnect-mount-manager
-# Optional: Remove device symlinks from your home directory
-# ls -la ~ | grep "^l.*->"  # List symlinks to identify device links
+rm -rf ~/.gsconnect-mount
 ```
 
-## Tested On
+## Troubleshooting
 
-- Ubuntu (Gnome)
+**Device not detected:**
+- Ensure GSConnect is installed and device is paired
+- Check if file sharing is enabled on your phone
+- Verify the device appears in GSConnect settings
+
+**Bookmark not working:**
+- Check if `~/.gsconnect-mount/Device-Name/` directory exists
+- Verify symlinks are not broken: `ls -la ~/.gsconnect-mount/*/`
+
+**Service issues:**
+- Check logs: `journalctl --user -u gsconnect-mount-manager -n 20`
+- Restart service: `systemctl --user restart gsconnect-mount-manager`
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly before committing
+5. Submit a pull request
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.

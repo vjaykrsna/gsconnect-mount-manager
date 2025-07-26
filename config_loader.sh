@@ -13,11 +13,13 @@ DEFAULT_ENABLE_NOTIFICATIONS=true
 DEFAULT_LOG_LEVEL="INFO"
 DEFAULT_MAX_LOG_SIZE=10
 DEFAULT_LOG_ROTATE_COUNT=5
+DEFAULT_MOUNT_STRUCTURE_DIR="$HOME/.gsconnect-mount"
 DEFAULT_ENABLE_INTERNAL_STORAGE=true
 DEFAULT_ENABLE_EXTERNAL_STORAGE=true
 DEFAULT_INTERNAL_STORAGE_PATH="storage/emulated/0"
-DEFAULT_INTERNAL_STORAGE_SUFFIX=""
-DEFAULT_EXTERNAL_STORAGE_SUFFIX="-SDCard"
+DEFAULT_INTERNAL_STORAGE_NAME="Internal"
+DEFAULT_EXTERNAL_STORAGE_NAME="SDCard"
+DEFAULT_USB_STORAGE_NAME="USB-OTG"
 DEFAULT_EXTERNAL_STORAGE_PATTERNS="storage/[0-9A-F][0-9A-F][0-9A-F][0-9A-F]* storage/sdcard1 storage/extSdCard storage/external_sd storage/usbotg"
 DEFAULT_MAX_EXTERNAL_STORAGE=3
 DEFAULT_AUTO_CLEANUP=true
@@ -40,11 +42,13 @@ load_config() {
     LOG_LEVEL=$DEFAULT_LOG_LEVEL
     MAX_LOG_SIZE=$DEFAULT_MAX_LOG_SIZE
     LOG_ROTATE_COUNT=$DEFAULT_LOG_ROTATE_COUNT
+    MOUNT_STRUCTURE_DIR=$DEFAULT_MOUNT_STRUCTURE_DIR
     ENABLE_INTERNAL_STORAGE=$DEFAULT_ENABLE_INTERNAL_STORAGE
     ENABLE_EXTERNAL_STORAGE=$DEFAULT_ENABLE_EXTERNAL_STORAGE
     INTERNAL_STORAGE_PATH=$DEFAULT_INTERNAL_STORAGE_PATH
-    INTERNAL_STORAGE_SUFFIX=$DEFAULT_INTERNAL_STORAGE_SUFFIX
-    EXTERNAL_STORAGE_SUFFIX=$DEFAULT_EXTERNAL_STORAGE_SUFFIX
+    INTERNAL_STORAGE_NAME=$DEFAULT_INTERNAL_STORAGE_NAME
+    EXTERNAL_STORAGE_NAME=$DEFAULT_EXTERNAL_STORAGE_NAME
+    USB_STORAGE_NAME=$DEFAULT_USB_STORAGE_NAME
     EXTERNAL_STORAGE_PATTERNS=$DEFAULT_EXTERNAL_STORAGE_PATTERNS
     MAX_EXTERNAL_STORAGE=$DEFAULT_MAX_EXTERNAL_STORAGE
     AUTO_CLEANUP=$DEFAULT_AUTO_CLEANUP
@@ -79,11 +83,13 @@ load_config() {
                 LOG_LEVEL) LOG_LEVEL="$value" ;;
                 MAX_LOG_SIZE) MAX_LOG_SIZE="$value" ;;
                 LOG_ROTATE_COUNT) LOG_ROTATE_COUNT="$value" ;;
+                MOUNT_STRUCTURE_DIR) MOUNT_STRUCTURE_DIR="$value" ;;
                 ENABLE_INTERNAL_STORAGE) ENABLE_INTERNAL_STORAGE="$value" ;;
                 ENABLE_EXTERNAL_STORAGE) ENABLE_EXTERNAL_STORAGE="$value" ;;
                 INTERNAL_STORAGE_PATH) INTERNAL_STORAGE_PATH="$value" ;;
-                INTERNAL_STORAGE_SUFFIX) INTERNAL_STORAGE_SUFFIX="$value" ;;
-                EXTERNAL_STORAGE_SUFFIX) EXTERNAL_STORAGE_SUFFIX="$value" ;;
+                INTERNAL_STORAGE_NAME) INTERNAL_STORAGE_NAME="$value" ;;
+                EXTERNAL_STORAGE_NAME) EXTERNAL_STORAGE_NAME="$value" ;;
+                USB_STORAGE_NAME) USB_STORAGE_NAME="$value" ;;
                 EXTERNAL_STORAGE_PATTERNS) EXTERNAL_STORAGE_PATTERNS="$value" ;;
                 MAX_EXTERNAL_STORAGE) MAX_EXTERNAL_STORAGE="$value" ;;
                 AUTO_CLEANUP) AUTO_CLEANUP="$value" ;;
@@ -97,10 +103,11 @@ load_config() {
     MOUNT_ROOT=$(eval echo "$MOUNT_ROOT")
     CONFIG_DIR=$(eval echo "$CONFIG_DIR")
     BOOKMARK_FILE=$(eval echo "$BOOKMARK_FILE")
-    
-    # Set symlink directory to HOME if empty
+    MOUNT_STRUCTURE_DIR=$(eval echo "$MOUNT_STRUCTURE_DIR")
+
+    # Set symlink directory to MOUNT_STRUCTURE_DIR if empty
     if [[ -z "$SYMLINK_DIR" ]]; then
-        SYMLINK_DIR="$HOME"
+        SYMLINK_DIR="$MOUNT_STRUCTURE_DIR"
     else
         SYMLINK_DIR=$(eval echo "$SYMLINK_DIR")
     fi
@@ -259,15 +266,18 @@ CONFIG_DIR="$HOME/.config/gsconnect-mount-manager"
 # Location of GTK bookmarks file
 BOOKMARK_FILE="$HOME/.config/gtk-3.0/bookmarks"
 
-# Custom symlink directory (default: $HOME)
-# Set to empty string to use $HOME
+# Custom symlink directory (default: $HOME/.gsconnect-mount)
+# Set to empty string to use $HOME/.gsconnect-mount
 SYMLINK_DIR=""
+
+# Mount structure directory (where device folders are created)
+MOUNT_STRUCTURE_DIR="$HOME/.gsconnect-mount"
 
 # Custom symlink prefix (added before device name)
 # Example: "Phone-" would create "Phone-DeviceName" symlinks
 SYMLINK_PREFIX=""
 
-# Custom symlink suffix (added after device name)  
+# Custom symlink suffix (added after device name)
 # Example: "-Storage" would create "DeviceName-Storage" symlinks
 SYMLINK_SUFFIX=""
 
