@@ -39,7 +39,7 @@ Automatically organize and access your Android device storage when connected via
 ```
 
 **File Manager Experience:**
-- Click "iQOO Z9x 5G" bookmark → Opens device folder
+- Click "IQOO Z9x 5G" bookmark → Opens device folder
 - See `Internal/`, `SDCard/` folders → Click to browse storage
 - Natural folder navigation, no complex paths
 

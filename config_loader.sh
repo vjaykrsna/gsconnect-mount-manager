@@ -283,10 +283,6 @@ CONFIG_DIR="$HOME/.config/gsconnect-mount-manager"
 # Location of GTK bookmarks file
 BOOKMARK_FILE="$HOME/.config/gtk-3.0/bookmarks"
 
-# Custom symlink directory (default: $HOME/.gsconnect-mount)
-# Set to empty string to use $HOME/.gsconnect-mount
-SYMLINK_DIR=""
-
 # Mount structure directory (where device folders are created)
 MOUNT_STRUCTURE_DIR="$HOME/.gsconnect-mount"
 
@@ -320,13 +316,6 @@ ENABLE_EXTERNAL_STORAGE=true
 # Custom internal storage path (default: storage/emulated/0)
 INTERNAL_STORAGE_PATH="storage/emulated/0"
 
-# Internal storage symlink suffix (added to device name)
-# Example: "Internal" creates "DeviceName-Internal"
-INTERNAL_STORAGE_SUFFIX=""
-
-# External storage symlink suffix (added to device name)
-# Example: "SDCard" creates "DeviceName-SDCard"
-EXTERNAL_STORAGE_SUFFIX="-SDCard"
 
 # External storage detection patterns (space-separated list)
 # Patterns to match external storage directories

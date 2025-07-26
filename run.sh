@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 # Get the directory where this script is located
@@ -314,10 +314,10 @@ create_device_structure() {
         mkdir -p "$(dirname "$BOOKMARK_FILE")"
         echo "$entry" >> "$BOOKMARK_FILE"
         echo "$entry" > "$BOOKMARK_ENTRY_FILE"
-        log_message "INFO" "🔖 Device bookmark added: $label" >&2
-        log_message "DEBUG" "Bookmark points to accessible directory: $device_dir" >&2
+        log_message "INFO" "🔖 Device bookmark added: $label"
+        log_message "DEBUG" "Bookmark points to accessible directory: $device_dir"
     else
-        log_message "DEBUG" "Bookmark already exists: $label" >&2
+        log_message "DEBUG" "Bookmark already exists: $label"
     fi
 
     echo "$device_dir"
