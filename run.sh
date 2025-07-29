@@ -28,13 +28,15 @@ log_message() {
     local message="$2"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
-    # Check if we should log this level
-    case "$LOG_LEVEL" in
-        DEBUG) ;;
-        INFO) [[ "$level" == "DEBUG" ]] && return ;;
-        WARN) [[ "$level" == "DEBUG" || "$level" == "INFO" ]] && return ;;
-        ERROR) [[ "$level" != "ERROR" ]] && return ;;
-    esac
+    # Check if we should log this level (always log if VERBOSE is true)
+    if [[ "$VERBOSE" != true ]]; then
+        case "$LOG_LEVEL" in
+            DEBUG) ;;
+            INFO) [[ "$level" == "DEBUG" ]] && return ;;
+            WARN) [[ "$level" == "DEBUG" || "$level" == "INFO" ]] && return ;;
+            ERROR) [[ "$level" != "ERROR" ]] && return ;;
+        esac
+    fi
 
     # Write to log file (plain text, no colors)
     echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
@@ -84,9 +86,16 @@ send_notification() {
 
 get_device_name() {
     local mnt_path=$1
+    log_message "DEBUG" "Attempting to get device name from mount path: $mnt_path"
     local host=$(echo "$mnt_path" | sed -n 's/.*host=\([^,]*\).*/\1/p')
+    log_message "DEBUG" "Extracted host IP: $host"
 
-    log_message "DEBUG" "Looking for device with host IP: $host"
+    if [[ -z "$host" ]]; then
+        log_message "ERROR" "Could not extract host IP from mount path: $mnt_path"
+        return 1
+    fi
+
+    log_message "DEBUG" "Looking for GSConnect device with host IP: $host"
 
     # Check if dconf is available
     if ! command -v dconf >/dev/null 2>&1; then
@@ -100,22 +109,23 @@ get_device_name() {
         log_message "ERROR" "Cannot access GSConnect device list. GSConnect may not be configured."
         return 1
     fi
+    log_message "DEBUG" "Found GSConnect devices: $(echo "$device_list" | tr '\n' ' ')"
 
     for dev_id in $(echo "$device_list" | grep '/$'); do
         local full_path="/org/gnome/shell/extensions/gsconnect/device/${dev_id}"
+        log_message "DEBUG" "Checking device path: $full_path"
         local last_conn_ip=$(dconf read "${full_path}last-connection" 2>/dev/null | tr -d "'" | sed -n 's/lan:\/\/\([^:]*\):.*/\1/p')
-
-        log_message "DEBUG" "Checking device $dev_id with IP: $last_conn_ip"
+        log_message "DEBUG" "Device $dev_id has last known IP: $last_conn_ip"
 
         if [[ "$last_conn_ip" == "$host" ]]; then
             local device_name=$(dconf read "${full_path}name" 2>/dev/null | tr -d "'")
-            log_message "DEBUG" "Found matching device: $device_name"
+            log_message "INFO" "Found matching device: '$device_name' for IP $host"
             echo "$device_name"
             return 0
         fi
     done
 
-    log_message "WARN" "No matching device found for host $host"
+    log_message "WARN" "No matching GSConnect device found for host IP: $host"
     return 1
 }
 
@@ -144,30 +154,46 @@ sanitize_device_name() {
 
 # Function to cleanup broken symlinks
 cleanup_broken_symlinks() {
-    if [[ "$AUTO_CLEANUP" == true ]] && [[ -d "$MOUNT_STRUCTURE_DIR" ]]; then
-        log_message "DEBUG" "Checking for broken symlinks in $MOUNT_STRUCTURE_DIR"
+    if [[ "$AUTO_CLEANUP" != true ]]; then
+        log_message "DEBUG" "Auto cleanup disabled. Skipping."
+        return
+    fi
 
-        # Find broken symlinks in device directories (avoid subshell)
-        local broken_links
-        mapfile -t broken_links < <(find "$MOUNT_STRUCTURE_DIR" -type l ! -exec test -e {} \; -print 2>/dev/null)
+    if [[ ! -d "$MOUNT_STRUCTURE_DIR" ]]; then
+        log_message "DEBUG" "Mount structure directory not found. Skipping cleanup."
+        return
+    fi
 
+    log_message "DEBUG" "Starting cleanup of broken symlinks in $MOUNT_STRUCTURE_DIR"
+    local broken_links
+    mapfile -t broken_links < <(find "$MOUNT_STRUCTURE_DIR" -type l ! -exec test -e {} \; -print 2>/dev/null)
+
+    if [[ ${#broken_links[@]} -gt 0 ]]; then
+        log_message "DEBUG" "Found ${#broken_links[@]} broken symlinks."
         for broken_link in "${broken_links[@]}"; do
             if [[ -n "$broken_link" ]]; then
                 rm "$broken_link"
                 log_message "INFO" "Cleaned up broken symlink: $broken_link"
             fi
         done
+    else
+        log_message "DEBUG" "No broken symlinks found."
+    fi
 
-        # Remove empty device directories (avoid subshell)
-        local empty_dirs
-        mapfile -t empty_dirs < <(find "$MOUNT_STRUCTURE_DIR" -mindepth 1 -maxdepth 1 -type d -empty -print 2>/dev/null)
+    log_message "DEBUG" "Checking for empty device directories..."
+    local empty_dirs
+    mapfile -t empty_dirs < <(find "$MOUNT_STRUCTURE_DIR" -mindepth 1 -maxdepth 1 -type d -empty -print 2>/dev/null)
 
+    if [[ ${#empty_dirs[@]} -gt 0 ]]; then
+        log_message "DEBUG" "Found ${#empty_dirs[@]} empty device directories."
         for empty_dir in "${empty_dirs[@]}"; do
             if [[ -n "$empty_dir" ]]; then
                 rmdir "$empty_dir"
                 log_message "INFO" "Cleaned up empty device directory: $(basename "$empty_dir")"
             fi
         done
+    else
+        log_message "DEBUG" "No empty device directories found."
     fi
 }
 
@@ -176,74 +202,74 @@ discover_storage_paths() {
     local mount_point="$1"
     local storage_paths=()
 
-    log_message "DEBUG" "Discovering storage paths in: $mount_point"
+    log_message "DEBUG" "Starting storage path discovery in: $mount_point"
 
     # Check for internal storage
     if [[ "$ENABLE_INTERNAL_STORAGE" == true ]]; then
+        log_message "DEBUG" "Internal storage detection enabled. Path: $INTERNAL_STORAGE_PATH"
         local internal_path="$mount_point/$INTERNAL_STORAGE_PATH"
         if [[ -d "$internal_path" ]]; then
             storage_paths+=("internal:$internal_path")
-            log_message "DEBUG" "Found internal storage: $internal_path"
+            log_message "INFO" "Found internal storage: $internal_path"
         else
-            log_message "WARN" "Internal storage not found: $internal_path"
+            log_message "WARN" "Internal storage path not found: $internal_path"
         fi
+    else
+        log_message "DEBUG" "Internal storage detection disabled."
     fi
 
     # Check for external storage
     if [[ "$ENABLE_EXTERNAL_STORAGE" == true ]]; then
+        log_message "DEBUG" "External storage detection enabled. Patterns: $EXTERNAL_STORAGE_PATTERNS"
         local storage_dir="$mount_point/storage"
         if [[ -d "$storage_dir" ]]; then
             local external_count=0
-
-            # Convert patterns to array
             IFS=' ' read -ra patterns <<< "$EXTERNAL_STORAGE_PATTERNS"
+            log_message "DEBUG" "Searching for patterns in: $storage_dir"
 
             for pattern in "${patterns[@]}"; do
-                # Stop if we've reached the maximum
                 if [[ $external_count -ge $MAX_EXTERNAL_STORAGE ]]; then
+                    log_message "DEBUG" "Reached max external storage limit ($MAX_EXTERNAL_STORAGE). Stopping search."
                     break
                 fi
 
-                # Handle glob patterns
+                log_message "DEBUG" "Checking pattern: $pattern"
                 if [[ "$pattern" == *"*"* ]]; then
-                    # Use find for glob patterns (limit depth for performance)
                     local found_paths
                     mapfile -t found_paths < <(find "$storage_dir" -maxdepth 1 -type d -name "${pattern##*/}" -print 2>/dev/null)
-
                     for external_path in "${found_paths[@]}"; do
                         if [[ -n "$external_path" ]] && [[ -d "$external_path" ]] && [[ $external_count -lt $MAX_EXTERNAL_STORAGE ]]; then
                             storage_paths+=("external:$external_path")
-                            log_message "DEBUG" "Found external storage: $external_path"
+                            log_message "INFO" "Found external storage (glob): $external_path"
                             ((external_count++))
-                        fi
-
-                        # Stop if we've reached the maximum
-                        if [[ $external_count -ge $MAX_EXTERNAL_STORAGE ]]; then
-                            break
                         fi
                     done
                 else
-                    # Direct path check (faster)
                     local external_path="$mount_point/$pattern"
                     if [[ -d "$external_path" ]] && [[ $external_count -lt $MAX_EXTERNAL_STORAGE ]]; then
                         storage_paths+=("external:$external_path")
-                        log_message "DEBUG" "Found external storage: $external_path"
+                        log_message "INFO" "Found external storage (direct): $external_path"
                         ((external_count++))
                     fi
                 fi
             done
 
             if [[ $external_count -eq 0 ]]; then
-                log_message "DEBUG" "No external storage found"
+                log_message "DEBUG" "No external storage devices found matching patterns."
             fi
         else
-            log_message "DEBUG" "Storage directory not found: $storage_dir"
+            log_message "WARN" "Base storage directory not found: $storage_dir"
         fi
+    else
+        log_message "DEBUG" "External storage detection disabled."
     fi
 
-    # Return the discovered paths (handle empty array safely)
+    # Return the discovered paths
     if [[ ${#storage_paths[@]} -gt 0 ]]; then
+        log_message "DEBUG" "Discovered storage paths: ${storage_paths[*]}"
         printf '%s\n' "${storage_paths[@]}"
+    else
+        log_message "WARN" "No storage paths were discovered."
     fi
 }
 
@@ -288,7 +314,7 @@ create_storage_symlink() {
     # Create the symlink
     if ln -s "$target_path" "$link_path"; then
         echo "$link_path" >> "$LINK_PATH_FILE"
-        log_message "INFO" "🔗 ${storage_type^} storage linked: $folder_name → $(basename "$target_path")"
+        log_message "INFO" "🔗 ${storage_type^} storage linked: $link_path → $target_path"
         return 0
     else
         log_message "ERROR" "Failed to create symlink: $link_path"
@@ -448,36 +474,40 @@ while true; do
         # Remove device bookmark
         if [[ -f "$BOOKMARK_ENTRY_FILE" ]]; then
             local entry_to_remove=$(cat "$BOOKMARK_ENTRY_FILE")
+            log_message "DEBUG" "Found bookmark entry to remove: $entry_to_remove"
             if [[ -n "$entry_to_remove" ]] && [[ -f "$BOOKMARK_FILE" ]] && grep -qF "$entry_to_remove" "$BOOKMARK_FILE"; then
                 grep -vF "$entry_to_remove" "$BOOKMARK_FILE" > "$BOOKMARK_FILE.tmp" && mv "$BOOKMARK_FILE.tmp" "$BOOKMARK_FILE"
-                log_message "INFO" "🔖 Device bookmark removed"
+                log_message "INFO" "🔖 Device bookmark removed: $entry_to_remove"
+            else
+                log_message "DEBUG" "Bookmark entry not found in bookmark file or file does not exist."
             fi
             rm "$BOOKMARK_ENTRY_FILE"
+        else
+            log_message "DEBUG" "No bookmark entry file found."
         fi
 
         # Remove symlinks and device directory
         if [[ -f "$LINK_PATH_FILE" ]]; then
+            log_message "DEBUG" "Found link path file. Processing symlinks for removal."
             symlink_count=0
             device_dir=""
             device_name=""
 
             while IFS= read -r link_to_remove; do
                 if [[ -n "$link_to_remove" ]] && [[ -L "$link_to_remove" ]]; then
-                    # Extract device directory from first symlink
                     if [[ -z "$device_dir" ]]; then
                         device_dir=$(dirname "$link_to_remove")
                         device_name=$(basename "$device_dir")
+                        log_message "DEBUG" "Determined device directory for cleanup: $device_dir"
                     fi
-
                     rm "$link_to_remove"
-                    log_message "INFO" "🔗 Storage symlink removed: $(basename "$link_to_remove")"
+                    log_message "INFO" "🔗 Storage symlink removed: $link_to_remove"
                     ((symlink_count++))
                 fi
             done < "$LINK_PATH_FILE"
 
-            # Remove device directory if it exists and is empty
             if [[ -n "$device_dir" ]] && [[ -d "$device_dir" ]]; then
-                # Remove directory if empty
+                log_message "DEBUG" "Attempting to remove device directory: $device_dir"
                 if rmdir "$device_dir" 2>/dev/null; then
                     log_message "INFO" "📁 Device directory removed: $device_dir"
                 else
@@ -486,12 +516,14 @@ while true; do
             fi
 
             if [[ $symlink_count -gt 0 ]]; then
-                log_message "INFO" "Removed $symlink_count storage symlink(s)"
+                log_message "INFO" "Removed $symlink_count storage symlink(s)."
                 if [[ -n "$device_name" ]]; then
                     send_notification "Device unmounted: $device_name\n$symlink_count storage path(s) disconnected"
                 fi
             fi
             rm "$LINK_PATH_FILE"
+        else
+            log_message "DEBUG" "No link path file found."
         fi
 
         rm "$FLAG_FILE"
