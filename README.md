@@ -162,6 +162,10 @@ chmod +x uninstall.sh
 4. Test thoroughly before committing
 5. Submit a pull request
 
+## Acknowledgements
+
+This project was originally based on the work of [fjueic/gsconnect-mount-manager](https://github.com/fjueic/gsconnect-mount-manager). While it has since undergone significant changes, the initial inspiration and foundation are gratefully acknowledged.
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
