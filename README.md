@@ -100,12 +100,13 @@ systemctl --user restart gsconnect-mount-manager
 - `INTERNAL_STORAGE_NAME`: Folder name for internal storage (default: `Internal`).
 - `EXTERNAL_STORAGE_NAME`: Base name for SD cards (default: `SDCard`).
 - `USB_STORAGE_NAME`: Base name for USB-OTG devices (default: `USB-OTG`).
+- `DETECT_GVFS_PATH`: Automatically detect the correct GVFS mount path (default: `true`).
 
 ### Storage Detection
 - `ENABLE_INTERNAL_STORAGE`: `true` to mount internal storage.
 - `ENABLE_EXTERNAL_STORAGE`: `true` to detect and mount SD cards/USB.
 - `INTERNAL_STORAGE_PATH`: Path to internal storage on the device.
-- `EXTERNAL_STORAGE_PATTERNS`: Space-separated patterns to find external storage (e.g., `storage/sdcard1 storage/*[0-9A-F]`).
+- `EXTERNAL_STORAGE_PATTERNS`: Space-separated patterns to find external storage (e.g., `storage/sdcard1 storage/*[0-9A-F]`). Extended patterns now support more Android devices.
 - `MAX_EXTERNAL_STORAGE`: Maximum number of external drives to mount.
 - `STORAGE_TIMEOUT`: How long to wait for storage to appear after connection (seconds).
 
@@ -153,6 +154,11 @@ chmod +x uninstall.sh
 **Service issues:**
 - Check logs: `journalctl --user -u gsconnect-mount-manager -n 20`
 - Restart service: `systemctl --user restart gsconnect-mount-manager`
+
+**Storage not detected:**
+- The script now supports more storage path patterns for different Android devices
+- Check if `DETECT_GVFS_PATH` is enabled to automatically detect the correct mount path
+- You can customize `EXTERNAL_STORAGE_PATTERNS` to match your device's storage paths
 
 ## Contributing
 

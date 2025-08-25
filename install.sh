@@ -71,7 +71,9 @@ chmod +x "$install_dir/config_loader.sh"
 # Create configuration file
 config_file="$install_dir/config.conf"
 printf "%sCreating default configuration file...%s\n" "$GREEN" "$NC"
-cp -f ./config.conf "$config_file"
+# Use the create_default_config function to generate a proper config file
+source "$install_dir/config_loader.sh"
+create_default_config "$config_file"
 
 # Create systemd service file
 printf "%sCreating systemd service...%s\n" "$GREEN" "$NC"

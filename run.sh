@@ -79,9 +79,29 @@ rotate_logs() {
 
 # Desktop notification function
 send_notification() {
-    if [[ "$ENABLE_NOTIFICATIONS" == true ]] && command -v notify-send >/dev/null 2>&1; then
-        notify-send "GSConnect Mount Manager" "$1" --icon=phone 2>/dev/null || true
+    if [[ "$ENABLE_NOTIFICATIONS" != true ]]; then
+        return
     fi
+    
+    local message="$1"
+    
+    # Try multiple notification systems based on desktop environment
+    local desktop_env=$(echo "$XDG_CURRENT_DESKTOP" | tr '[:upper:]' '[:lower:]')
+    
+    # KDE notification
+    if [[ "$desktop_env" == *"kde"* ]] && command -v kdialog >/dev/null 2>&1; then
+        kdialog --passivepopup "$message" 5 2>/dev/null || true
+        return
+    fi
+    
+    # GNOME and other desktops with notify-send
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send "GSConnect Mount Manager" "$message" --icon=phone 2>/dev/null || true
+        return
+    fi
+    
+    # Fallback to terminal output if no notification system available
+    log_message "INFO" "Notification: $message"
 }
 
 get_device_name() {
@@ -93,7 +113,8 @@ get_device_name() {
     
     # Suppress all log output when called in command substitution to prevent ANSI codes in device name
     log_message "DEBUG" "Attempting to get device name from mount path: $mnt_path" >/dev/null 2>&1
-    local host=$(echo "$mnt_path" | sed -n 's/.*host=\([^,]*\).*/\1/p')
+    # Extract host IP, but escape special characters to prevent regex injection
+    local host=$(echo "$mnt_path" | sed -n 's/.*host=\([^,]*\).*/\1/p' | sed 's/[[\.*^$()+?{|]/\\&/g')
     log_message "DEBUG" "Extracted host IP: $host" >/dev/null 2>&1
 
     if [[ -z "$host" ]]; then
@@ -126,10 +147,13 @@ get_device_name() {
     for dev_id in $(echo "$device_list" | grep '/$'); do
         local full_path="/org/gnome/shell/extensions/gsconnect/device/${dev_id}"
         log_message "DEBUG" "Checking device path: $full_path" >/dev/null 2>&1
-        local last_conn_ip=$(dconf read "${full_path}last-connection" 2>/dev/null | tr -d "'" | sed -n 's/lan:\/\/\([^:]*\):.*/\1/p')
+        # Extract last connection IP, but escape special characters to prevent regex injection
+        local last_conn_ip=$(dconf read "${full_path}last-connection" 2>/dev/null | tr -d "'" | sed -n 's/lan:\/\/\([^:]*\):.*/\1/p' | sed 's/[[\.*^$()+?{|]/\\&/g')
         log_message "DEBUG" "Device $dev_id has last known IP: $last_conn_ip" >/dev/null 2>&1
 
-        if [[ "$last_conn_ip" == "$host" ]]; then
+        # Escape special characters in host to prevent regex injection
+        local escaped_host=$(printf '%s\n' "$host" | sed 's/[[\.*^$()+?{|]/\\&/g')
+        if [[ "$last_conn_ip" == "$escaped_host" ]]; then
             local device_name=$(dconf read "${full_path}name" 2>/dev/null | tr -d "'")
             log_message "INFO" "Found matching device: '$device_name' for IP $host" >/dev/null 2>&1
             # Restore original VERBOSE setting
@@ -164,6 +188,34 @@ sanitize_device_name() {
     fi
 
     echo "$sanitized"
+}
+
+# Function to detect GVFS mount path
+detect_gvfs_path() {
+    # If detection is disabled, return the configured path
+    if [[ "$DETECT_GVFS_PATH" != true ]]; then
+        echo "$MOUNT_ROOT"
+        return
+    fi
+    
+    # Try common GVFS paths
+    local possible_paths=(
+        "/run/user/$(id -u)/gvfs"           # Most common path
+        "/home/$(id -un)/.gvfs"             # Older GNOME versions
+        "/var/run/user/$(id -u)/gvfs"       # Some distributions
+    )
+    
+    for path in "${possible_paths[@]}"; do
+        if [[ -d "$path" ]]; then
+            log_message "DEBUG" "Detected GVFS path: $path"
+            echo "$path"
+            return
+        fi
+    done
+    
+    # If none found, return the configured path
+    log_message "WARN" "No GVFS path found, using configured path: $MOUNT_ROOT"
+    echo "$MOUNT_ROOT"
 }
 
 
@@ -250,9 +302,15 @@ discover_storage_paths() {
                 fi
 
                 log_message "DEBUG" "Checking pattern: $pattern"
-                if [[ "$pattern" == *"*"* ]]; then
+                
+                # Handle different pattern types
+                if [[ "$pattern" == *"*"* ]] || [[ "$pattern" == *"["*"]"* ]] || [[ "$pattern" == *"?"* ]]; then
+                    # This is a glob pattern, use find with -name
                     local found_paths
-                    mapfile -t found_paths < <(find "$storage_dir" -maxdepth 1 -type d -name "${pattern##*/}" -print 2>/dev/null)
+                    if ! mapfile -t found_paths < <(find "$storage_dir" -maxdepth 1 -type d -name "${pattern##*/}" -print 2>/dev/null); then
+                        log_message "WARN" "Failed to execute find command for pattern: $pattern in $storage_dir"
+                        continue
+                    fi
                     for external_path in "${found_paths[@]}"; do
                         if [[ -n "$external_path" ]] && [[ -d "$external_path" ]] && [[ $external_count -lt $MAX_EXTERNAL_STORAGE ]]; then
                             storage_paths+=("external:$external_path")
@@ -261,6 +319,7 @@ discover_storage_paths() {
                         fi
                     done
                 else
+                    # Direct path pattern
                     local external_path="$mount_point/$pattern"
                     if [[ -d "$external_path" ]] && [[ $external_count -lt $MAX_EXTERNAL_STORAGE ]]; then
                         storage_paths+=("external:$external_path")
@@ -270,8 +329,29 @@ discover_storage_paths() {
                 fi
             done
 
+            # Fallback: if no external storage found, try to find any storage directories
             if [[ $external_count -eq 0 ]]; then
-                log_message "DEBUG" "No external storage devices found matching patterns."
+                log_message "DEBUG" "No external storage devices found matching patterns. Trying fallback detection."
+                local fallback_paths
+                if ! mapfile -t fallback_paths < <(find "$storage_dir" -maxdepth 1 -type d -not -name "emulated" -not -name "." -print 2>/dev/null); then
+                    log_message "WARN" "Failed to execute fallback find command in $storage_dir"
+                else
+                    for fallback_path in "${fallback_paths[@]}"; do
+                        if [[ -n "$fallback_path" ]] && [[ -d "$fallback_path" ]] && [[ $external_count -lt $MAX_EXTERNAL_STORAGE ]]; then
+                            # Skip common system directories
+                            local basename_fallback=$(basename "$fallback_path")
+                            if [[ "$basename_fallback" != "self" ]] && [[ "$basename_fallback" != "emulated" ]]; then
+                                storage_paths+=("external:$fallback_path")
+                                log_message "INFO" "Found external storage (fallback): $fallback_path"
+                                ((external_count++))
+                            fi
+                        fi
+                    done
+                fi
+            fi
+            
+            if [[ $external_count -eq 0 ]]; then
+                log_message "DEBUG" "No external storage devices found."
             fi
         else
             log_message "WARN" "Base storage directory not found: $storage_dir"
@@ -352,14 +432,40 @@ create_device_structure() {
     local label="${SYMLINK_PREFIX}${device_name_display}${SYMLINK_SUFFIX}"
     local entry="file://$device_dir $label"
 
-    if ! grep -qxF "$entry" "$BOOKMARK_FILE" 2>/dev/null; then
-        mkdir -p "$(dirname "$BOOKMARK_FILE")"
-        echo "$entry" >> "$BOOKMARK_FILE"
-        echo "$entry" > "$BOOKMARK_ENTRY_FILE"
-        log_message "INFO" "🔖 Device bookmark added: $label"
-        log_message "DEBUG" "Bookmark points to accessible directory: $device_dir"
+    # Check desktop environment and create appropriate bookmark
+    local desktop_env=$(echo "$XDG_CURRENT_DESKTOP" | tr '[:upper:]' '[:lower:]')
+    
+    # For KDE, we can try to add to KDE bookmarks if available
+    if [[ "$desktop_env" == *"kde"* ]]; then
+        # Try to add to KDE bookmarks using kwriteconfig5 if available
+        if command -v kwriteconfig5 >/dev/null 2>&1; then
+            # KDE bookmarks are stored in ~/.local/share/user-places.xbel
+            # We'll add the bookmark using kwriteconfig5
+            kwriteconfig5 --file ~/.local/share/user-places.xbel --group "Places" --key "GSConnectMount-$device_name_sanitized" "$device_dir" 2>/dev/null || true
+            log_message "INFO" "🔖 Device bookmark added to KDE: $label"
+        else
+            # Fall back to GTK bookmarks if kwriteconfig5 is not available
+            if ! grep -qxF "$entry" "$BOOKMARK_FILE" 2>/dev/null; then
+                mkdir -p "$(dirname "$BOOKMARK_FILE")"
+                echo "$entry" >> "$BOOKMARK_FILE"
+                echo "$entry" > "$BOOKMARK_ENTRY_FILE"
+                log_message "INFO" "🔖 Device bookmark added (fallback to GTK): $label"
+                log_message "DEBUG" "Bookmark points to accessible directory: $device_dir"
+            else
+                log_message "DEBUG" "Bookmark already exists: $label"
+            fi
+        fi
     else
-        log_message "DEBUG" "Bookmark already exists: $label"
+        # For GNOME and other desktop environments, use GTK bookmarks
+        if ! grep -qxF "$entry" "$BOOKMARK_FILE" 2>/dev/null; then
+            mkdir -p "$(dirname "$BOOKMARK_FILE")"
+            echo "$entry" >> "$BOOKMARK_FILE"
+            echo "$entry" > "$BOOKMARK_ENTRY_FILE"
+            log_message "INFO" "🔖 Device bookmark added: $label"
+            log_message "DEBUG" "Bookmark points to accessible directory: $device_dir"
+        else
+            log_message "DEBUG" "Bookmark already exists: $label"
+        fi
     fi
 
     echo "$device_dir"
@@ -378,7 +484,16 @@ while true; do
     # Clean up broken symlinks periodically
     cleanup_broken_symlinks
 
-    MNT=$(find "$MOUNT_ROOT" -maxdepth 1 -type d -name 'sftp:*' | head -n1 || true)
+    # Detect GVFS path if enabled
+    local actual_mount_root=$(detect_gvfs_path)
+    
+    # Use a more robust approach to find the mount point
+    local find_result
+    if ! find_result=$(find "$actual_mount_root" -maxdepth 1 -type d -name 'sftp:*' 2>/dev/null | head -n1); then
+        log_message "WARN" "Failed to execute find command for SFTP mounts in $actual_mount_root"
+        find_result=""
+    fi
+    MNT="$find_result"
 
     if [[ -n "$MNT" ]] && ! [[ -f "$FLAG_FILE" ]]; then
         # Mounted and not flagged -> run mount logic

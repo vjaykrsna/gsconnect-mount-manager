@@ -20,11 +20,12 @@ DEFAULT_INTERNAL_STORAGE_PATH="storage/emulated/0"
 DEFAULT_INTERNAL_STORAGE_NAME="Internal"
 DEFAULT_EXTERNAL_STORAGE_NAME="SDCard"
 DEFAULT_USB_STORAGE_NAME="USB-OTG"
-DEFAULT_EXTERNAL_STORAGE_PATTERNS="storage/[0-9A-F][0-9A-F][0-9A-F][0-9A-F]* storage/sdcard1 storage/extSdCard storage/external_sd storage/usbotg"
+DEFAULT_EXTERNAL_STORAGE_PATTERNS="storage/[0-9A-F][0-9A-F][0-9A-F][0-9A-F]* storage/sdcard1 storage/extSdCard storage/external_sd storage/usbotg storage/[0-9a-f]{4}-[0-9a-f]{4} storage/????-???? storage/???????????????? storage/emulated/1 storage/emulated/2 storage/emulated/external storage/????-????-????-????"
 DEFAULT_MAX_EXTERNAL_STORAGE=3
 DEFAULT_AUTO_CLEANUP=true
 DEFAULT_STORAGE_TIMEOUT=30
 DEFAULT_VERBOSE=false
+DEFAULT_DETECT_GVFS_PATH=true
 
 # Function to load configuration
 load_config() {
@@ -58,20 +59,29 @@ load_config() {
     # Load config file if it exists
     if [[ -f "$config_file" ]]; then
         # Source the config file, but only load valid variable assignments
-        while IFS='=' read -r key value; do
+        while IFS= read -r line || [[ -n "$line" ]]; do
             # Skip comments and empty lines
-            [[ $key =~ ^[[:space:]]*# ]] && continue
-            [[ -z $key ]] && continue
+            [[ $line =~ ^[[:space:]]*# ]] && continue
+            [[ -z $line ]] && continue
             
-            # Remove leading/trailing whitespace
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            
-            # Remove quotes from value if present
-            value=$(echo "$value" | sed 's/^["'\'']\|["'\'']$//g')
-            
-            # Set the variable if it's a known config option
-            case "$key" in
+            # Extract key and value using parameter expansion
+            # This handles values containing equals signs properly
+            if [[ $line == *"="* ]]; then
+                key="${line%%=*}"
+                value="${line#*=}"
+                
+                # Remove leading/trailing whitespace
+                key=$(echo "$key" | xargs)
+                value=$(echo "$value" | xargs)
+                
+                # Remove quotes from value if present, but be more precise
+                # Only remove matching quotes at the beginning and end
+                if [[ "$value" =~ ^\".*\"$ ]] || [[ "$value" =~ ^\'.*\'$ ]]; then
+                    value="${value:1:${#value}-2}"
+                fi
+                
+                # Set the variable if it's a known config option
+                case "$key" in
                 POLL_INTERVAL) POLL_INTERVAL="$value" ;;
                 MOUNT_ROOT) MOUNT_ROOT="$value" ;;
                 CONFIG_DIR) CONFIG_DIR="$value" ;;
@@ -95,7 +105,9 @@ load_config() {
                 AUTO_CLEANUP) AUTO_CLEANUP="$value" ;;
                 STORAGE_TIMEOUT) STORAGE_TIMEOUT="$value" ;;
                 VERBOSE) VERBOSE="$value" ;;
+                DETECT_GVFS_PATH) DETECT_GVFS_PATH="$value" ;;
             esac
+            fi
         done < "$config_file"
     fi
     
@@ -214,6 +226,15 @@ load_config() {
         echo "Warning: Invalid MAX_EXTERNAL_STORAGE '$MAX_EXTERNAL_STORAGE', using default: $DEFAULT_MAX_EXTERNAL_STORAGE"
         MAX_EXTERNAL_STORAGE=$DEFAULT_MAX_EXTERNAL_STORAGE
     fi
+    
+    # Validate DETECT_GVFS_PATH
+    case "$DETECT_GVFS_PATH" in
+        true|false) ;;
+        *)
+            echo "Warning: Invalid DETECT_GVFS_PATH '$DETECT_GVFS_PATH', using default: $DEFAULT_DETECT_GVFS_PATH"
+            DETECT_GVFS_PATH=$DEFAULT_DETECT_GVFS_PATH
+            ;;
+    esac
 
     # Validate directory names don't contain problematic characters
     if [[ "$INTERNAL_STORAGE_NAME" =~ [/\\] ]]; then
@@ -319,7 +340,19 @@ INTERNAL_STORAGE_PATH="storage/emulated/0"
 
 # External storage detection patterns (space-separated list)
 # Patterns to match external storage directories
-EXTERNAL_STORAGE_PATTERNS="storage/[0-9A-F][0-9A-F][0-9A-F][0-9A-F]* storage/sdcard1 storage/extSdCard storage/external_sd storage/usbotg"
+# Common patterns include:
+# - storage/[0-9A-F][0-9A-F][0-9A-F][0-9A-F]* - UUID-based storage (Samsung, etc.)
+# - storage/sdcard1 - Secondary storage
+# - storage/extSdCard - External SD card
+# - storage/external_sd - External SD card (alternative)
+# - storage/usbotg - USB OTG storage
+# - storage/[0-9a-f]{4}-[0-9a-f]{4} - Lowercase UUID-based storage
+# - storage/????-???? - Generic pattern for storage with dash
+# - storage/???????????????? - Generic pattern for long storage names
+# - storage/emulated/1, storage/emulated/2 - Additional emulated storage
+# - storage/emulated/external - External emulated storage
+# - storage/????-????-????-???? - Four-part UUID storage
+EXTERNAL_STORAGE_PATTERNS="storage/[0-9A-F][0-9A-F][0-9A-F][0-9A-F]* storage/sdcard1 storage/extSdCard storage/external_sd storage/usbotg storage/[0-9a-f]{4}-[0-9a-f]{4} storage/????-???? storage/???????????????? storage/emulated/1 storage/emulated/2 storage/emulated/external storage/????-????-????-????"
 
 # Maximum number of external storage devices to detect
 MAX_EXTERNAL_STORAGE=3
@@ -332,5 +365,9 @@ STORAGE_TIMEOUT=30
 
 # Enable verbose logging (true/false)
 VERBOSE=false
+
+# Automatically detect GVFS mount path (true/false)
+# If true, will try to detect the correct GVFS path instead of using the default
+DETECT_GVFS_PATH=true
 EOF
 }
