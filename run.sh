@@ -86,46 +86,62 @@ send_notification() {
 
 get_device_name() {
     local mnt_path=$1
-    log_message "DEBUG" "Attempting to get device name from mount path: $mnt_path"
+    # Temporarily store the current VERBOSE setting
+    local original_verbose="$VERBOSE"
+    # Temporarily disable verbose logging to prevent stdout interference
+    VERBOSE=false
+    
+    # Suppress all log output when called in command substitution to prevent ANSI codes in device name
+    log_message "DEBUG" "Attempting to get device name from mount path: $mnt_path" >/dev/null 2>&1
     local host=$(echo "$mnt_path" | sed -n 's/.*host=\([^,]*\).*/\1/p')
-    log_message "DEBUG" "Extracted host IP: $host"
+    log_message "DEBUG" "Extracted host IP: $host" >/dev/null 2>&1
 
     if [[ -z "$host" ]]; then
-        log_message "ERROR" "Could not extract host IP from mount path: $mnt_path"
+        log_message "ERROR" "Could not extract host IP from mount path: $mnt_path" >/dev/null 2>&1
+        # Restore original VERBOSE setting
+        VERBOSE="$original_verbose"
         return 1
     fi
 
-    log_message "DEBUG" "Looking for GSConnect device with host IP: $host"
+    log_message "DEBUG" "Looking for GSConnect device with host IP: $host" >/dev/null 2>&1
 
     # Check if dconf is available
     if ! command -v dconf >/dev/null 2>&1; then
-        log_message "ERROR" "dconf command not found. GSConnect may not be installed."
+        log_message "ERROR" "dconf command not found. GSConnect may not be installed." >/dev/null 2>&1
+        # Restore original VERBOSE setting
+        VERBOSE="$original_verbose"
         return 1
     fi
 
     # Find the device ID that matches the host IP
     local device_list
     if ! device_list=$(dconf list /org/gnome/shell/extensions/gsconnect/device/ 2>/dev/null); then
-        log_message "ERROR" "Cannot access GSConnect device list. GSConnect may not be configured."
+        log_message "ERROR" "Cannot access GSConnect device list. GSConnect may not be configured." >/dev/null 2>&1
+        # Restore original VERBOSE setting
+        VERBOSE="$original_verbose"
         return 1
     fi
-    log_message "DEBUG" "Found GSConnect devices: $(echo "$device_list" | tr '\n' ' ')"
+    log_message "DEBUG" "Found GSConnect devices: $(echo "$device_list" | tr '\n' ' ')" >/dev/null 2>&1
 
     for dev_id in $(echo "$device_list" | grep '/$'); do
         local full_path="/org/gnome/shell/extensions/gsconnect/device/${dev_id}"
-        log_message "DEBUG" "Checking device path: $full_path"
+        log_message "DEBUG" "Checking device path: $full_path" >/dev/null 2>&1
         local last_conn_ip=$(dconf read "${full_path}last-connection" 2>/dev/null | tr -d "'" | sed -n 's/lan:\/\/\([^:]*\):.*/\1/p')
-        log_message "DEBUG" "Device $dev_id has last known IP: $last_conn_ip"
+        log_message "DEBUG" "Device $dev_id has last known IP: $last_conn_ip" >/dev/null 2>&1
 
         if [[ "$last_conn_ip" == "$host" ]]; then
             local device_name=$(dconf read "${full_path}name" 2>/dev/null | tr -d "'")
-            log_message "INFO" "Found matching device: '$device_name' for IP $host"
+            log_message "INFO" "Found matching device: '$device_name' for IP $host" >/dev/null 2>&1
+            # Restore original VERBOSE setting
+            VERBOSE="$original_verbose"
             echo "$device_name"
             return 0
         fi
     done
 
-    log_message "WARN" "No matching GSConnect device found for host IP: $host"
+    log_message "WARN" "No matching GSConnect device found for host IP: $host" >/dev/null 2>&1
+    # Restore original VERBOSE setting
+    VERBOSE="$original_verbose"
     return 1
 }
 
