@@ -1,5 +1,5 @@
 
-#!/bin/sh
+#!/bin/bash
 set -eu
 
 # Colors for output
@@ -72,7 +72,7 @@ chmod +x "$install_dir/config_loader.sh"
 config_file="$install_dir/config.conf"
 printf "%sCreating default configuration file...%s\n" "$GREEN" "$NC"
 # Use the create_default_config function to generate a proper config file
-source "$install_dir/config_loader.sh"
+. "$install_dir/config_loader.sh"
 create_default_config "$config_file"
 
 # Create systemd service file
