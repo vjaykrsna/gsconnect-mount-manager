@@ -1,30 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Updating GSConnect Mount Manager..."
+# -------- Colors --------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-# Check if we're in a git repository
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    echo "Error: Not in a git repository"
+log() { printf "%b%s%b\n" "$1" "$2" "$NC"; }
+
+log "$YELLOW" "Updating GSConnect Mount Manager..."
+
+# -------- Ensure git repo --------
+if ! git rev-parse --git-dir &>/dev/null; then
+    log "$RED" "Not in a git repository. Cannot update."
     exit 1
 fi
 
-# Try to pull latest changes, but handle cases where origin or main might be different
-if ! git pull; then
-    echo "Warning: Failed to pull from default remote. Trying origin main..."
-    if ! git pull origin main; then
-        echo "Error: Failed to pull from origin main"
+# -------- Pull latest changes --------
+if ! git pull --ff-only; then
+    log "$YELLOW" "Default pull failed. Trying origin/main..."
+    if ! git pull origin main --ff-only; then
+        log "$RED" "Failed to pull from origin main."
         exit 1
     fi
 fi
 
-# Check if install.sh exists before running it
-if [ ! -f "./install.sh" ]; then
-    echo "Error: install.sh not found"
+# -------- Warn if uncommitted changes exist --------
+if ! git diff-index --quiet HEAD --; then
+    log "$YELLOW" "Warning: You have uncommitted changes. They might be overwritten."
+fi
+
+# -------- Run installer --------
+if [[ ! -f "./install.sh" ]]; then
+    log "$RED" "install.sh not found. Cannot update."
     exit 1
 fi
 
-# Run installer (handles updates)
-./install.sh
+if ! ./install.sh; then
+    log "$RED" "Installation/update failed."
+    exit 1
+fi
 
-echo "Update complete!"
+log "$GREEN" "✅ Update complete!"

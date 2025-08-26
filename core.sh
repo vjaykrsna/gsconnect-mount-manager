@@ -1,125 +1,111 @@
-#!/bin/bash
-# Core utilities and foundational functions for GSConnect Mount Manager
+#!/usr/bin/env bash
+set -euo pipefail
 
-# File locking functions
+# -----------------------------
+# GSConnect Mount Manager Core Utilities
+# -----------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/gsconnect-mount-manager}"
+LOG_FILE="$CONFIG_DIR/gsconnect-mount-manager.log"
+FLAG_LOCK="/tmp/gsconnect-mount-manager.lock"
+
+# -----------------------------
+# Logging Functions
+# -----------------------------
+
+log_conditional() {
+    # Usage: log_conditional "LEVEL" "Message"
+    local level="$1"
+    shift
+    local message="$*"
+
+    local levels=("DEBUG" "INFO" "WARN" "ERROR")
+    local level_priority=0
+    case "$level" in
+        DEBUG) level_priority=0 ;;
+        INFO)  level_priority=1 ;;
+        WARN)  level_priority=2 ;;
+        ERROR) level_priority=3 ;;
+        *) level_priority=1 ;;  # default INFO
+    esac
+
+    # Only log if level is >= configured LOG_LEVEL
+    declare -A log_map=( ["DEBUG"]=0 ["INFO"]=1 ["WARN"]=2 ["ERROR"]=3 )
+    if [[ ${log_map[$LOG_LEVEL]:-1} -le $level_priority ]]; then
+        printf "[%s] %s\n" "$level" "$message" | tee -a "$LOG_FILE"
+    fi
+}
+
+rotate_logs() {
+    # Rotate logs if size exceeds MAX_LOG_SIZE MB
+    local max_size_bytes=$((MAX_LOG_SIZE * 1024 * 1024))
+    if [[ -f "$LOG_FILE" ]] && [[ $(stat -c%s "$LOG_FILE") -ge $max_size_bytes ]]; then
+        for ((i=LOG_ROTATE_COUNT; i>1; i--)); do
+            [[ -f "$LOG_FILE.$((i-1))" ]] && mv "$LOG_FILE.$((i-1))" "$LOG_FILE.$i"
+        done
+        mv "$LOG_FILE" "$LOG_FILE.1"
+        touch "$LOG_FILE"
+        log_conditional "INFO" "Rotated logs"
+    fi
+}
+
+# -----------------------------
+# File Locking Utilities
+# -----------------------------
+
 lock_file() {
-    local lockfile="$1.lock"
-    local timeout="${2:-10}"
-    local count=0
-    
-    while [[ $count -lt $timeout ]]; do
-        if mkdir "$lockfile" 2>/dev/null; then
-            echo $$ > "$lockfile/PID" 2>/dev/null || true
-            return 0
-        fi
-        sleep 1
-        ((count++))
-    done
-    
-    return 1
+    local file="$1"
+    exec 200>"$file"
+    flock -n 200 && return 0 || return 1
 }
 
 unlock_file() {
-    local lockfile="$1.lock"
-    if [[ -d "$lockfile" ]] && [[ -f "$lockfile/PID" ]] && [[ "$(cat "$lockfile/PID")" == "$$" ]]; then
-        rm -rf "$lockfile"
-    fi
+    local file="$1"
+    exec 200>&-
 }
 
-# Logging functions
-log_message() {
-    local level="$1"
-    local message="$2"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+# -----------------------------
+# Notification Functions
+# -----------------------------
 
-    # Check if we should log this level (always log if VERBOSE is true)
-    if [[ "$VERBOSE" != true ]]; then
-        case "$LOG_LEVEL" in
-            DEBUG) ;;
-            INFO) [[ "$level" == "DEBUG" ]] && return ;;
-            WARN) [[ "$level" == "DEBUG" || "$level" == "INFO" ]] && return ;;
-            ERROR) [[ "$level" != "ERROR" ]] && return ;;
-        esac
-    fi
-
-    # Write to log file (plain text, no colors)
-    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
-
-    # Output to console with colors (only if not DEBUG or if VERBOSE is true)
-    if [[ "$level" != "DEBUG" ]] || [[ "$VERBOSE" == true ]]; then
-        case "$level" in
-            ERROR) echo -e "\033[0;31m[$timestamp] [$level] $message\033[0m" ;;
-            WARN) echo -e "\033[1;33m[$timestamp] [$level] $message\033[0m" ;;
-            INFO) echo -e "\033[0;32m[$timestamp] [$level] $message\033[0m" ;;
-            DEBUG) [[ "$VERBOSE" == true ]] && echo -e "\033[0;36m[$timestamp] [$level] $message\033[0m" ;;
-        esac
-    fi
-}
-
-# Conditional logging function for command substitution contexts
-log_conditional() {
-    local level="$1"
-    local message="$2"
-    
-    # Only log if not in command substitution (when stdout is not captured)
-    if [[ -t 1 ]]; then
-        log_message "$level" "$message"
-    fi
-}
-
-# Log rotation function
-rotate_logs() {
-    if [[ "$MAX_LOG_SIZE" -gt 0 ]] && [[ -f "$LOG_FILE" ]]; then
-        # Get file size in bytes (portable way)
-        local size_bytes
-        if command -v stat >/dev/null 2>&1; then
-            # Try GNU stat first, then BSD stat
-            size_bytes=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
-        else
-            # Fallback using ls and awk
-            size_bytes=$(ls -l "$LOG_FILE" 2>/dev/null | awk '{print $5}' || echo 0)
-        fi
-
-        local size_mb=$((size_bytes / 1024 / 1024))
-        if [[ "$size_mb" -gt "$MAX_LOG_SIZE" ]]; then
-            if lock_file "$LOG_FILE"; then
-                for i in $(seq $((LOG_ROTATE_COUNT-1)) -1 1); do
-                    [[ -f "$LOG_FILE.$i" ]] && mv "$LOG_FILE.$i" "$LOG_FILE.$((i+1))"
-                done
-                mv "$LOG_FILE" "$LOG_FILE.1"
-                touch "$LOG_FILE"
-                unlock_file "$LOG_FILE"
-                log_conditional "INFO" "Log rotated (was ${size_mb}MB)"
-            else
-                log_conditional "ERROR" "Failed to acquire lock for log file during rotation"
-            fi
-        fi
-    fi
-}
-
-# Desktop notification function
 send_notification() {
-    if [[ "$ENABLE_NOTIFICATIONS" != true ]]; then
-        return
-    fi
-    
     local message="$1"
-    
-    # Try multiple notification systems based on desktop environment
-    local desktop_env=$(echo "$XDG_CURRENT_DESKTOP" | tr '[:upper:]' '[:lower:]')
-    
-    # KDE notification
-    if [[ "$desktop_env" == *"kde"* ]] && command -v kdialog >/dev/null 2>&1; then
-        kdialog --passivepopup "$message" 5 2>/dev/null
-        return
+    if [[ "$ENABLE_NOTIFICATIONS" == true ]] && command -v notify-send >/dev/null 2>&1; then
+        notify-send "GSConnect Mount Manager" "$message"
     fi
-    
-    # GNOME and other desktops with notify-send
-    if command -v notify-send >/dev/null 2>&1; then
-        notify-send "GSConnect Mount Manager" "$message" --icon=phone 2>/dev/null
-        return
-    fi
-    
-    # Fallback to terminal output if no notification system available
-    log_conditional "INFO" "Notification: $message"
 }
+
+# -----------------------------
+# Misc Utilities
+# -----------------------------
+
+sanitize_device_name() {
+    # Remove problematic characters from filenames
+    local name="$1"
+    name="${name// /_}"
+    name="${name//[^a-zA-Z0-9._-]/}"
+    echo "$name"
+}
+
+# Wait until directory exists with timeout
+wait_for_dir() {
+    local dir="$1"
+    local timeout="${2:-30}"  # default 30s
+    local count=0
+    while [[ ! -d "$dir" ]] && [[ $count -lt $timeout ]]; do
+        sleep 1
+        ((count++))
+    done
+    [[ -d "$dir" ]]
+}
+
+# Detect GVFS path (if dynamic)
+detect_gvfs_path() {
+    if [[ "$DETECT_GVFS_PATH" == true ]]; then
+        echo "/run/user/$(id -u)/gvfs"
+    else
+        echo "$MOUNT_ROOT"
+    fi
+}
+
