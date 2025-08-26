@@ -44,7 +44,7 @@ script_dir=$(dirname "$0")
 cd "$script_dir" || exit # Exit the script if cd doesn't work, prevents following commands from running
 
 # Check if required files exist
-required_files="run.sh config_loader.sh config.conf"
+required_files="run.sh config_loader.sh config.conf core.sh device.sh storage.sh"
 for file in $required_files; do
     if [ ! -f "$file" ]; then
         printf "%sError: Required file '%s' not found%s\n" "$RED" "$file" "$NC"
@@ -65,8 +65,14 @@ install_dir="$USER_HOME/.config/gsconnect-mount-manager"
 mkdir -p "$install_dir"
 cp -f ./run.sh "$install_dir/"
 cp -f ./config_loader.sh "$install_dir/"
+cp -f ./core.sh "$install_dir/"
+cp -f ./device.sh "$install_dir/"
+cp -f ./storage.sh "$install_dir/"
 chmod +x "$install_dir/run.sh"
 chmod +x "$install_dir/config_loader.sh"
+chmod +x "$install_dir/core.sh"
+chmod +x "$install_dir/device.sh"
+chmod +x "$install_dir/storage.sh"
 
 # Create configuration file
 config_file="$install_dir/config.conf"
