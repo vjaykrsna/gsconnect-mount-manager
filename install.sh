@@ -31,7 +31,7 @@ error()   { printf "%s[ERROR] %s%s\n" "$RED" "$*" "$NC"; }
 # -----------------------------
 
 check_dependencies() {
-    local deps=("systemctl" "bash" "mkdir" "grep" "sed" "tee" "ln" "cp" "mv" "date")
+    local deps=("systemctl" "bash" "mkdir" "grep" "sed" "cp" "mv" "date")
     for cmd in "${deps[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             error "Required command not found: $cmd"
@@ -41,19 +41,36 @@ check_dependencies() {
 }
 
 create_config_dir() {
-    [[ ! -d "$CONFIG_DIR" ]] && mkdir -p "$CONFIG_DIR" && info "Created config directory: $CONFIG_DIR"
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        info "Created config directory: $CONFIG_DIR"
+    fi
 }
 
 backup_existing_config() {
-    [[ -f "$CONFIG_DIR/config.conf" ]] && mv "$CONFIG_DIR/config.conf" "$CONFIG_DIR/config.conf.bak_$(date +%s)" && info "Backed up existing config.conf"
+    if [[ -f "$CONFIG_DIR/config.conf" ]]; then
+        mv "$CONFIG_DIR/config.conf" "$CONFIG_DIR/config.conf.bak_$(date +%s)"
+        info "Backed up existing config.conf"
+    fi
 }
 
 copy_default_config() {
-    [[ -f "$SCRIPT_DIR/config.conf" ]] && cp "$SCRIPT_DIR/config.conf" "$CONFIG_DIR/" && info "Copied default config.conf"
+    if [[ -f "$SCRIPT_DIR/config.conf" ]]; then
+        cp "$SCRIPT_DIR/config.conf" "$CONFIG_DIR/"
+        info "Copied default config.conf"
+    fi
+}
+
+copy_scripts() {
+    info "Copying scripts..."
+    cp "$SCRIPT_DIR"/*.sh "$CONFIG_DIR/"
+    chmod +x "$CONFIG_DIR"/*.sh
+    info "Scripts copied and made executable."
 }
 
 install_service() {
     info "Installing systemd user service..."
+    mkdir -p "$(dirname "$SERVICE_FILE")"
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=GSConnect Mount Manager
@@ -61,7 +78,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$SCRIPT_DIR/run.sh
+ExecStart=$CONFIG_DIR/run.sh
 Restart=always
 RestartSec=5
 # Full PATH for systemd environment
@@ -85,5 +102,6 @@ check_dependencies
 create_config_dir
 backup_existing_config
 copy_default_config
+copy_scripts
 install_service
 info "✅ Installation complete!"

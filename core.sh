@@ -33,7 +33,7 @@ log_conditional() {
     # Only log if level is >= configured LOG_LEVEL
     declare -A log_map=( ["DEBUG"]=0 ["INFO"]=1 ["WARN"]=2 ["ERROR"]=3 )
     if [[ ${log_map[$LOG_LEVEL]:-1} -le $level_priority ]]; then
-        printf "[%s] %s\n" "$level" "$message" | tee -a "$LOG_FILE"
+        printf "[%s] %s\n" "$level" "$message" | /usr/bin/tee -a "$LOG_FILE"
     fi
 }
 
@@ -108,4 +108,3 @@ detect_gvfs_path() {
         echo "$MOUNT_ROOT"
     fi
 }
-

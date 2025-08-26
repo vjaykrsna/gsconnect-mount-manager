@@ -75,7 +75,7 @@ create_storage_symlink() {
     local link_path="$device_dir/$name"
 
     if [[ ! -e "$link_path" ]]; then
-        ln -s "$storage_path" "$link_path"
+        /bin/ln -s "$storage_path" "$link_path"
         log_conditional "INFO" "Created symlink: $link_path -> $storage_path"
         echo "$link_path" >> "$LINK_PATH_FILE"
         return 0
