@@ -5,12 +5,12 @@ set -euo pipefail
 # GSConnect Mount Manager Runner
 # -----------------------------
 
-# Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/gsconnect-mount-manager}"
 
 # Load configuration
 . "$SCRIPT_DIR/config_loader.sh"
-load_config "$SCRIPT_DIR/config.conf"
+load_config "$CONFIG_DIR/config.conf"
 echo "Configuration loaded"
 
 # Validate configuration
@@ -25,7 +25,6 @@ FLAG_FILE="$CONFIG_DIR/mounted"
 BOOKMARK_ENTRY_FILE="$CONFIG_DIR/bookmark_entry"
 LINK_PATH_FILE="$CONFIG_DIR/link_path"
 LOG_FILE="$CONFIG_DIR/gsconnect-mount-manager.log"
-
 mkdir -p "$CONFIG_DIR"
 
 # Source modules
@@ -43,7 +42,7 @@ while true; do
     rotate_logs
     cleanup_broken_symlinks
 
-    # Detect actual GVFS root
+    # Detect GVFS root
     GVFS_ROOT=$(detect_gvfs_path)
 
     # Find first SFTP mount
@@ -89,21 +88,15 @@ while true; do
             continue
         fi
 
-        # Create symlinks for storage paths
+        # Create symlinks
         SUCCESS_COUNT=0
         STORAGE_SUMMARY=()
         for storage_info in "${STORAGE_PATHS[@]}"; do
             TYPE="${storage_info%%:*}"
             PATH="${storage_info#*:}"
             INDEX=""
-
-            case "$TYPE" in
-                external) INDEX=1 ;;
-                usb) INDEX=1 ;;
-                internal) INDEX="" ;;
-                *) TYPE="external"; INDEX=1 ;;
-            esac
-
+            [[ "$TYPE" =~ ^(external|usb)$ ]] && INDEX=1
+            [[ -z "$TYPE" ]] && TYPE="external"
             if create_storage_symlink "$DEVICE_DIR" "$TYPE" "$PATH" "$INDEX"; then
                 ((SUCCESS_COUNT++))
                 LABEL="$TYPE"
@@ -114,7 +107,7 @@ while true; do
             fi
         done
 
-        # Flag device and notify
+        # Flag and notify
         if [[ $SUCCESS_COUNT -gt 0 ]]; then
             touch "$FLAG_FILE"
             send_notification "Device mounted: $DEVICE_NAME\nFolder: $DEVICE_SANITIZED\nStorage: $(printf '%s, ' "${STORAGE_SUMMARY[@]}" | sed 's/, $//')"
@@ -127,7 +120,6 @@ while true; do
     # Unmount handling
     # -----------------------------
     elif [[ -z "$MNT" ]] && [[ -f "$FLAG_FILE" ]]; then
-        # Remove bookmarks and symlinks
         [[ -f "$BOOKMARK_ENTRY_FILE" ]] && while IFS= read -r entry; do
             grep -vF "$entry" "$BOOKMARK_FILE" > "$BOOKMARK_FILE.tmp" && mv "$BOOKMARK_FILE.tmp" "$BOOKMARK_FILE"
         done < "$BOOKMARK_ENTRY_FILE" || true

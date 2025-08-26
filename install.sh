@@ -8,6 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="$HOME/.config/gsconnect-mount-manager"
 SERVICE_FILE="$HOME/.config/systemd/user/gsconnect-mount-manager.service"
+
 # Check if colors are supported
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
     RED=$(tput setaf 1)
@@ -30,7 +31,7 @@ error()   { printf "%s[ERROR] %s%s\n" "$RED" "$*" "$NC"; }
 # -----------------------------
 
 check_dependencies() {
-    local deps=("systemctl" "bash" "mkdir" "grep" "sed")
+    local deps=("systemctl" "bash" "mkdir" "grep" "sed" "tee" "ln" "cp" "mv" "date")
     for cmd in "${deps[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             error "Required command not found: $cmd"
@@ -40,10 +41,15 @@ check_dependencies() {
 }
 
 create_config_dir() {
-    if [[ ! -d "$CONFIG_DIR" ]]; then
-        mkdir -p "$CONFIG_DIR"
-        info "Created config directory: $CONFIG_DIR"
-    fi
+    [[ ! -d "$CONFIG_DIR" ]] && mkdir -p "$CONFIG_DIR" && info "Created config directory: $CONFIG_DIR"
+}
+
+backup_existing_config() {
+    [[ -f "$CONFIG_DIR/config.conf" ]] && mv "$CONFIG_DIR/config.conf" "$CONFIG_DIR/config.conf.bak_$(date +%s)" && info "Backed up existing config.conf"
+}
+
+copy_default_config() {
+    [[ -f "$SCRIPT_DIR/config.conf" ]] && cp "$SCRIPT_DIR/config.conf" "$CONFIG_DIR/" && info "Copied default config.conf"
 }
 
 install_service() {
@@ -58,6 +64,9 @@ Type=simple
 ExecStart=$SCRIPT_DIR/run.sh
 Restart=always
 RestartSec=5
+# Full PATH for systemd environment
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HOME=$HOME"
 
 [Install]
 WantedBy=default.target
@@ -68,32 +77,13 @@ EOF
     info "Service installed and started"
 }
 
-backup_existing_config() {
-    if [[ -f "$CONFIG_DIR/config.conf" ]]; then
-        mv "$CONFIG_DIR/config.conf" "$CONFIG_DIR/config.conf.bak_$(date +%s)"
-        info "Backed up existing config.conf"
-    fi
-}
-
-copy_default_config() {
-    if [[ -f "$SCRIPT_DIR/config.conf" ]]; then
-        cp "$SCRIPT_DIR/config.conf" "$CONFIG_DIR/"
-        info "Copied default config.conf to $CONFIG_DIR"
-    else
-        warn "No config.conf found in script directory, skipping"
-    fi
-}
-
 # -----------------------------
 # Main
 # -----------------------------
-
 info "Starting GSConnect Mount Manager installation..."
-
 check_dependencies
 create_config_dir
 backup_existing_config
 copy_default_config
 install_service
-
 info "✅ Installation complete!"
