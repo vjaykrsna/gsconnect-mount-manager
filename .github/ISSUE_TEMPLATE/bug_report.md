@@ -13,14 +13,14 @@ A clear and concise description of what the bug is.
 **Run the debug script**
 ```bash
 # Download and run the debug collector
-curl -fsSL https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main/debug_log.sh -o debug_log.sh
-chmod +x debug_log.sh
-./debug_log.sh
+curl -fsSL https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main/debug.sh -o debug.sh
+chmod +x debug.sh
+./debug.sh
 ```
 
 **Or if you have the repository cloned:**
 ```bash
-./debug_log.sh
+./debug.sh
 ```
 
 **What the debug script does:**
@@ -31,7 +31,7 @@ chmod +x debug_log.sh
 - Restores original configuration
 
 **Share the output:**
-Send the link provided by the script, or attach the `~/gsmm-debug.log` file along with your issue
+Send the link provided by the script, or attach the `gmm-debug.log` file along with your issue.
 
 **Additional context**
 Add any other context about the problem here.
