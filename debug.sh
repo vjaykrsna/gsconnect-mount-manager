@@ -5,10 +5,10 @@
 set -euo pipefail
 
 # --- Configuration ---
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gsconnect-mount-manager"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gmm"
 CONFIG_FILE="$CONFIG_DIR/config.conf"
-SERVICE_NAME="gsconnect-mount-manager.service"
-DEBUG_LOG="gsmm-debug.log"
+SERVICE_NAME="gmm.service"
+DEBUG_LOG="gmm-debug.log"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -37,7 +37,7 @@ main() {
     trap cleanup EXIT
 
     # Check if running from the correct directory
-    if [[ ! -f "gsconnect-mount-manager.sh" ]]; then
+    if [[ ! -f "gmm-main.sh" ]]; then
         error "This script must be run from the project's root directory."
         exit 1
     fi
@@ -45,13 +45,13 @@ main() {
     # Clear previous debug log
     rm -f "$DEBUG_LOG"
 
-    info "Collecting GSConnect Mount Manager debug info..."
+    info "Collecting GMM (GSConnect Mount Manager) debug info..."
     info "Log file will be saved to: $DEBUG_LOG"
 
     # --- Header ---
     {
         echo "================================================="
-        echo "== GSConnect Mount Manager Debug Report"
+        echo "== GMM (GSConnect Mount Manager) Debug Report"
         echo "================================================="
         echo "Date: $(date)"
         echo "Script Version: 1.0"
@@ -131,7 +131,7 @@ main() {
 
     # --- Logs and Service Status ---
     {
-        LOG_FILE="$CONFIG_DIR/gsconnect-mount-manager.log"
+        LOG_FILE="$CONFIG_DIR/gmm.log"
         echo "--- Service Status (systemctl) ---"
         systemctl --user status --no-pager "$SERVICE_NAME" 2>&1 || echo "Service not found."
         echo

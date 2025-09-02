@@ -6,11 +6,11 @@ set -euo pipefail
 # -------------------------------------------------------------------
 
 # --- Configuration ---
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gsconnect-mount-manager"
-SERVICE_NAME="gsconnect-mount-manager.service"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gmm"
+SERVICE_NAME="gmm.service"
 SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
-LOCK_FILE="/tmp/gsconnect-mount-manager.lock"
-SCRIPT_PATH="$CONFIG_DIR/gsconnect-mount-manager.sh"
+LOCK_FILE="/tmp/gmm.lock"
+SCRIPT_PATH="$CONFIG_DIR/gmm-main.sh"
 
 # --- Colors for output ---
 RED='\033[0;31m'
@@ -76,7 +76,7 @@ remove_lock_file() {
 
 # --- Main Uninstallation Logic ---
 main() {
-    info "Starting GSConnect Mount Manager uninstallation..."
+    info "Starting GMM (GSConnect Mount Manager) uninstallation..."
     
     read -p "Are you sure you want to uninstall? This will remove all configuration and service files. (y/N) " -n 1 -r
     echo

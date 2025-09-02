@@ -6,13 +6,16 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 
 # --- Configuration ---
-SCRIPT_NAME="gsconnect-mount-manager.sh"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gsconnect-mount-manager"
+SCRIPT_NAME="gmm-main.sh"
+LIB_SCRIPT_NAME="gmm-lib.sh"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gmm"
 CONFIG_FILE="$CONFIG_DIR/config.conf"
-SERVICE_NAME="gsconnect-mount-manager.service"
+SERVICE_NAME="gmm.service"
 SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
 SOURCE_SCRIPT_PATH="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/$SCRIPT_NAME"
+SOURCE_LIB_PATH="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/$LIB_SCRIPT_NAME"
 DEST_SCRIPT_PATH="$CONFIG_DIR/$SCRIPT_NAME"
+DEST_LIB_PATH="$CONFIG_DIR/$LIB_SCRIPT_NAME"
 
 # --- Colors for output ---
 RED='\033[0;31m'
@@ -20,7 +23,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-LOG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gsconnect-mount-manager/gsconnect-mount-manager.log"
+LOG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gmm/gmm.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
 
@@ -93,13 +96,13 @@ EOF
 }
 
 copy_script() {
-    info "Copying main script..."
+    info "Copying script files..."
+    
+    # --- Copy Main Script ---
     if [[ ! -f "$SOURCE_SCRIPT_PATH" ]]; then
         error "Source script not found at $SOURCE_SCRIPT_PATH"
         exit 1
     fi
-    
-    # Use cat to avoid quote escaping issues
     cat "$SOURCE_SCRIPT_PATH" > "$DEST_SCRIPT_PATH" || {
         error "Failed to copy script to $DEST_SCRIPT_PATH"
         exit 1
@@ -108,7 +111,18 @@ copy_script() {
         error "Failed to make script executable"
         exit 1
     }
-    info "Script copied and made executable at $DEST_SCRIPT_PATH"
+    info "Main script copied to $DEST_SCRIPT_PATH"
+
+    # --- Copy Library Script ---
+    if [[ ! -f "$SOURCE_LIB_PATH" ]]; then
+        error "Library script not found at $SOURCE_LIB_PATH"
+        exit 1
+    fi
+    cat "$SOURCE_LIB_PATH" > "$DEST_LIB_PATH" || {
+        error "Failed to copy library to $DEST_LIB_PATH"
+        exit 1
+    }
+    info "Library script copied to $DEST_LIB_PATH"
 }
 
 install_systemd_service() {
@@ -123,7 +137,7 @@ install_systemd_service() {
     mkdir -p "$(dirname "$SERVICE_FILE")"
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=GSConnect Mount Manager
+Description=GMM (GSConnect Mount Manager)
 After=network-online.target
 
 [Service]
@@ -155,7 +169,7 @@ EOF
 main() {
     printf -- '-%.0s' {1..50} >> "$LOG_FILE"
     printf "\n" >> "$LOG_FILE"
-    info "Starting GSConnect Mount Manager installation..."
+    info "Starting GMM (GSConnect Mount Manager) installation..."
 
     check_dependencies
     create_config_dir
