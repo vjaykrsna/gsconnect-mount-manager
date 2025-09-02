@@ -1,107 +1,175 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # GSConnect Mount Manager Installer
-# -----------------------------
+# -----------------------------------------------------------------------------
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="$HOME/.config/gsconnect-mount-manager"
-SERVICE_FILE="$HOME/.config/systemd/user/gsconnect-mount-manager.service"
+# --- Configuration ---
+SCRIPT_NAME="gsconnect-mount-manager.sh"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gsconnect-mount-manager"
+CONFIG_FILE="$CONFIG_DIR/config.conf"
+SERVICE_NAME="gsconnect-mount-manager.service"
+SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
+SOURCE_SCRIPT_PATH="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/$SCRIPT_NAME"
+DEST_SCRIPT_PATH="$CONFIG_DIR/$SCRIPT_NAME"
 
-# Check if colors are supported
-if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
-    RED=$(tput setaf 1)
-    GREEN=$(tput setaf 2)
-    YELLOW=$(tput setaf 3)
-    NC=$(tput sgr0)
-else
-    RED=""
-    GREEN=""
-    YELLOW=""
-    NC=""
-fi
+# --- Colors for output ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-info()    { printf "%s[INFO] %s%s\n" "$GREEN" "$*" "$NC"; }
-warn()    { printf "%s[WARN] %s%s\n" "$YELLOW" "$*" "$NC"; }
-error()   { printf "%s[ERROR] %s%s\n" "$RED" "$*" "$NC"; }
+LOG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gsconnect-mount-manager/gsconnect-mount-manager.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
 
-# -----------------------------
-# Functions
-# -----------------------------
+info() {
+    local msg="$*"
+    printf "%b[INFO] %s%b\n" "$GREEN" "$msg" "$NC"      # colored output
+    printf "[INFO] %s\n" "$msg" >> "$LOG_FILE"           # plain log
+}
 
+warn() {
+    local msg="$*"
+    printf "%b[WARN] %s%b\n" "$YELLOW" "$msg" "$NC"
+    printf "[WARN] %s\n" "$msg" >> "$LOG_FILE"
+}
+
+error() {
+    local msg="$*"
+    printf "%b[ERROR] %s%b\n" "$RED" "$msg" "$NC"
+    printf "[ERROR] %s\n" "$msg" >> "$LOG_FILE"
+}
+# --- Functions ---
 check_dependencies() {
-    local deps=("systemctl" "bash" "mkdir" "grep" "sed" "cp" "mv" "date")
+    info "Checking dependencies..."
+    
+    local deps=(systemctl bash mkdir cp chmod flock sed grep gio)
+    local missing=()
+    
     for cmd in "${deps[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
-            error "Required command not found: $cmd"
-            exit 1
+            missing+=("$cmd")
         fi
     done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        for cmd in "${missing[@]}"; do
+            error "Required command not found: $cmd"
+        done
+        error "Please install the missing dependencies and try again."
+        exit 1
+    else
+        info "All dependencies are installed."
+    fi
 }
 
 create_config_dir() {
+    info "Creating configuration directory..."
     if [[ ! -d "$CONFIG_DIR" ]]; then
         mkdir -p "$CONFIG_DIR"
-        info "Created config directory: $CONFIG_DIR"
+        info "Created directory: $CONFIG_DIR"
+    else
+        info "Configuration directory already exists: $CONFIG_DIR"
     fi
 }
 
-backup_existing_config() {
-    if [[ -f "$CONFIG_DIR/config.conf" ]]; then
-        mv "$CONFIG_DIR/config.conf" "$CONFIG_DIR/config.conf.bak_$(date +%s)"
-        info "Backed up existing config.conf"
+create_default_config() {
+    create_config_dir  # ensure the directory exists
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        info "Creating default configuration file..."
+        cat >"$CONFIG_FILE" <<'EOF'
+POLL_INTERVAL=3
+MOUNT_STRUCTURE_DIR="$HOME"
+LOG_LEVEL="INFO"
+ENABLE_BOOKMARKS=true
+EOF
+        info "Default configuration created at $CONFIG_FILE"
+    else
+        warn "Configuration file already exists. Skipping creation."
     fi
 }
 
-copy_default_config() {
-    if [[ -f "$SCRIPT_DIR/config.conf" ]]; then
-        cp "$SCRIPT_DIR/config.conf" "$CONFIG_DIR/"
-        info "Copied default config.conf"
+copy_script() {
+    info "Copying main script..."
+    if [[ ! -f "$SOURCE_SCRIPT_PATH" ]]; then
+        error "Source script not found at $SOURCE_SCRIPT_PATH"
+        exit 1
     fi
+    
+    # Use cat to avoid quote escaping issues
+    cat "$SOURCE_SCRIPT_PATH" > "$DEST_SCRIPT_PATH" || {
+        error "Failed to copy script to $DEST_SCRIPT_PATH"
+        exit 1
+    }
+    chmod +x "$DEST_SCRIPT_PATH" || {
+        error "Failed to make script executable"
+        exit 1
+    }
+    info "Script copied and made executable at $DEST_SCRIPT_PATH"
 }
 
-copy_scripts() {
-    info "Copying scripts..."
-    cp "$SCRIPT_DIR"/*.sh "$CONFIG_DIR/"
-    chmod +x "$CONFIG_DIR"/*.sh
-    info "Scripts copied and made executable."
-}
-
-install_service() {
+install_systemd_service() {
     info "Installing systemd user service..."
+
+    # Stop the service if it's already running to ensure a clean update
+    if systemctl --user is-active --quiet "$SERVICE_NAME"; then
+        info "Service is running. Stopping it for update..."
+        systemctl --user stop "$SERVICE_NAME" || warn "Failed to stop the service. Continuing anyway."
+    fi
+
     mkdir -p "$(dirname "$SERVICE_FILE")"
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=GSConnect Mount Manager
-After=network.target
+After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$CONFIG_DIR/run.sh
+ExecStart=$DEST_SCRIPT_PATH
 Restart=always
-RestartSec=5
-# Full PATH for systemd environment
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="HOME=$HOME"
+RestartSec=10
 
 [Install]
 WantedBy=default.target
 EOF
 
-    systemctl --user daemon-reload
-    systemctl --user enable --now gsconnect-mount-manager.service
-    info "Service installed and started"
+    info "Reloading systemd user daemon..."
+    systemctl --user daemon-reload || {
+        error "Failed to reload systemd user daemon"
+        exit 1
+    }
+
+    info "Enabling and starting the service..."
+    systemctl --user enable --now "$SERVICE_NAME" || {
+        error "Failed to enable/start service"
+        exit 1
+    }
+
+    info "Systemd service installed and started successfully"
 }
 
-# -----------------------------
-# Main
-# -----------------------------
-info "Starting GSConnect Mount Manager installation..."
-check_dependencies
-create_config_dir
-backup_existing_config
-copy_default_config
-copy_scripts
-install_service
-info "✅ Installation complete!"
+# --- Main Installation Logic ---
+main() {
+    printf -- '-%.0s' {1..50} >> "$LOG_FILE"
+    printf "\n" >> "$LOG_FILE"
+    info "Starting GSConnect Mount Manager installation..."
+
+    check_dependencies
+    create_config_dir
+    create_default_config
+    copy_script
+    install_systemd_service
+
+    info "-------------------------------------------------"
+    info "Installation complete!"
+    info "The service is now running in the background."
+    info "To view logs, run: journalctl --user -u $SERVICE_NAME -f"
+    info "To edit settings, modify: $CONFIG_FILE"
+    info "-------------------------------------------------"
+}
+
+# Run the installer
+main

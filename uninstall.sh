@@ -1,61 +1,100 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------- Colors --------
+# -------------------------------------------------------------------
+# GSConnect Mount Manager Uninstaller
+# -------------------------------------------------------------------
+
+# --- Configuration ---
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gsconnect-mount-manager"
+SERVICE_NAME="gsconnect-mount-manager.service"
+SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
+LOCK_FILE="/tmp/gsconnect-mount-manager.lock"
+SCRIPT_PATH="$CONFIG_DIR/gsconnect-mount-manager.sh"
+
+# --- Colors for output ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-log() { printf "%b%s%b\n" "$1" "$2" "$NC"; }
+info()  { printf "%b[INFO] %s%b\n"  "$GREEN" "$*" "$NC"; }
+warn()  { printf "%b[WARN] %s%b\n"  "$YELLOW" "$*" "$NC"; }
+error() { printf "%b[ERROR] %s%b\n" "$RED" "$*" "$NC"; }
 
-# -------- Paths --------
-SERVICE_FILE="$HOME/.config/systemd/user/gsconnect-mount-manager.service"
-CONFIG_DIR="$HOME/.config/gsconnect-mount-manager"
-MOUNT_DIR="$HOME/.gsconnect-mount"
-GTK_BOOKMARKS="$HOME/.config/gtk-3.0/bookmarks"
-KDE_BOOKMARKS="$HOME/.local/share/user-places.xbel"
-
-log "$YELLOW" "Uninstalling GSConnect Mount Manager..."
-
-# -------- Stop & disable service --------
-if command -v systemctl &>/dev/null; then
-    if systemctl --user is-active gsconnect-mount-manager.service &>/dev/null; then
-        log "$GREEN" "Stopping service..."
-        systemctl --user stop gsconnect-mount-manager.service
+# --- Functions ---
+stop_and_disable_service() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "systemctl not found. Skipping service removal."
+        return
     fi
 
-    if systemctl --user is-enabled gsconnect-mount-manager.service &>/dev/null; then
-        log "$GREEN" "Disabling service..."
-        systemctl --user disable gsconnect-mount-manager.service
+    info "Stopping and disabling systemd user service..."
+    if systemctl --user cat "$SERVICE_NAME" >/dev/null 2>&1; then
+        systemctl --user stop "$SERVICE_NAME" || warn "Service was not running."
+        systemctl --user disable "$SERVICE_NAME" || warn "Service was not enabled."
+        info "Service stopped and disabled."
+    else
+        warn "Service not found. It might have been already removed."
     fi
+}
 
+remove_service_file() {
     if [[ -f "$SERVICE_FILE" ]]; then
+        info "Removing systemd service file..."
         rm -f "$SERVICE_FILE"
-        log "$GREEN" "Service file removed"
+        systemctl --user daemon-reload || warn "Failed to reload systemd daemon."
+        info "Systemd daemon reloaded."
+    fi
+}
+
+remove_config_directory() {
+    if [[ -d "$CONFIG_DIR" ]]; then
+        info "Removing configuration directory..."
+        rm -rf "$CONFIG_DIR"
+        info "Directory removed: $CONFIG_DIR"
+    fi
+}
+
+run_script_cleanup() {
+    if [[ -x "$SCRIPT_PATH" ]]; then
+        info "Running cleanup task in the main script..."
+        # Run the script's own cleanup function to remove bookmarks and symlinks
+        "$SCRIPT_PATH" --uninstall-cleanup || warn "The script's cleanup function reported an error."
+    else
+        warn "Main script not found or not executable at $SCRIPT_PATH. Skipping artifact cleanup."
+        warn "You may need to manually remove any created bookmarks or directories in $HOME."
+    fi
+}
+
+remove_lock_file() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        info "Removing lock file..."
+        rm -f "$LOCK_FILE"
+    fi
+}
+
+# --- Main Uninstallation Logic ---
+main() {
+    info "Starting GSConnect Mount Manager uninstallation..."
+    
+    read -p "Are you sure you want to uninstall? This will remove all configuration and service files. (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        info "Uninstallation cancelled."
+        exit 0
     fi
 
-    systemctl --user daemon-reload
-fi
+    stop_and_disable_service
+    run_script_cleanup
+    remove_service_file
+    remove_config_directory
+    remove_lock_file
 
-# -------- Remove bookmarks --------
-if [[ -f "$GTK_BOOKMARKS" ]]; then
-    tmp=$(mktemp)
-    grep -v "gsconnect-mount" "$GTK_BOOKMARKS" > "$tmp" && mv "$tmp" "$GTK_BOOKMARKS"
-    log "$GREEN" "Cleaned GTK bookmarks"
-fi
+    info "-------------------------------------------------"
+    info "Uninstallation complete!"
+    info "All related files and services have been removed."
+    info "-------------------------------------------------"
+}
 
-if command -v kwriteconfig5 &>/dev/null; then
-    kwriteconfig5 --file "$KDE_BOOKMARKS" --group "Places" --key "GSConnectMount*" "" 2>/dev/null || \
-        log "$YELLOW" "Failed to clean KDE bookmarks"
-fi
-
-# -------- Remove directories --------
-for dir in "$CONFIG_DIR" "$MOUNT_DIR"; do
-    if [[ -d "$dir" ]]; then
-        rm -rf "$dir"
-        log "$GREEN" "Removed $dir"
-    fi
-done
-
-log "$GREEN" "✅ Uninstallation complete!"
+main

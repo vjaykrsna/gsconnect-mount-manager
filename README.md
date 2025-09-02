@@ -90,11 +90,14 @@ systemctl --user restart gsconnect-mount-manager
 
 ### Naming & Symlinks
 
+* `SYMLINK_DIR` – Directory to create symlinks in (defaults to `MOUNT_STRUCTURE_DIR`).
 * `SYMLINK_PREFIX` / `SYMLINK_SUFFIX` – Add text before/after device name.
 * `INTERNAL_STORAGE_NAME` – Folder name for internal storage.
 * `EXTERNAL_STORAGE_NAME` – Base name for SD cards.
 * `USB_STORAGE_NAME` – Base name for USB-OTG.
 * `DETECT_GVFS_PATH` – Automatically detect GVFS mount path.
+* `ENABLE_BOOKMARKS` – `true` or `false` to enable/disable GTK bookmarks.
+* `BOOKMARK_FILE` – Path to the GTK bookmarks file.
 
 ### Storage Detection
 
@@ -121,7 +124,6 @@ systemctl --user status gsconnect-mount-manager
 journalctl --user -u gsconnect-mount-manager -f
 systemctl --user stop gsconnect-mount-manager
 systemctl --user start gsconnect-mount-manager
-./identify_device.sh
 ```
 
 ---
@@ -143,6 +145,18 @@ Stops the service, removes files, and cleans bookmarks.
 * **Bookmarks missing:** Verify `~/.gsconnect-mount/Device-Name/` exists and symlinks are valid.
 * **Service issues:** `journalctl --user -u gsconnect-mount-manager -n 20` and restart service.
 * **Storage not detected:** Ensure `DETECT_GVFS_PATH` is enabled and patterns match your device.
+
+---
+
+## Debugging
+
+If you encounter issues, you can use the `debug.sh` script to collect system and application information.
+
+```bash
+./debug.sh
+```
+
+This will create a `gsmm-debug.log` file in the current directory containing detailed information for troubleshooting.
 
 ---
 
