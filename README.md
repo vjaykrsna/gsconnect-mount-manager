@@ -1,4 +1,4 @@
-# GSConnect Mount Manager
+# GMM (GSConnect Mount Manager)
 
 Automatically organizes and provides seamless access to your Android device storage via GSConnect. Creates clean bookmarks and symlinks for smooth file browsing.
 
@@ -54,16 +54,6 @@ chmod +x install.sh
 
 ---
 
-## Updating
-
-```bash
-cd gsconnect-mount-manager
-./update.sh
-```
-
-Pulls latest changes and reinstalls the service.
-
----
 
 ## Requirements
 
@@ -76,10 +66,10 @@ Pulls latest changes and reinstalls the service.
 
 ## Configuration
 
-Edit `~/.config/gsconnect-mount-manager/config.conf` and restart the service:
+Edit `~/.config/gmm/config.conf` and restart the service:
 
 ```bash
-systemctl --user restart gsconnect-mount-manager
+systemctl --user restart gmm
 ```
 
 ### General Settings
@@ -120,10 +110,10 @@ systemctl --user restart gsconnect-mount-manager
 ## Management Commands
 
 ```bash
-systemctl --user status gsconnect-mount-manager
-journalctl --user -u gsconnect-mount-manager -f
-systemctl --user stop gsconnect-mount-manager
-systemctl --user start gsconnect-mount-manager
+systemctl --user status gmm
+journalctl --user -u gmm -f
+systemctl --user stop gmm
+systemctl --user start gmm
 ```
 
 ---
@@ -142,8 +132,8 @@ Stops the service, removes files, and cleans bookmarks.
 ## Troubleshooting
 
 * **Device not detected:** Check GSConnect is installed and paired; enable file sharing.
-* **Bookmarks missing:** Verify `~/.gsconnect-mount/Device-Name/` exists and symlinks are valid.
-* **Service issues:** `journalctl --user -u gsconnect-mount-manager -n 20` and restart service.
+* **Bookmarks missing:** Verify the `~/Device-Name/` directory (or your custom `MOUNT_STRUCTURE_DIR`) exists and its symlinks are valid.
+* **Service issues:** `journalctl --user -u gmm -n 20` and restart the service.
 * **Storage not detected:** Ensure `DETECT_GVFS_PATH` is enabled and patterns match your device.
 
 ---
@@ -156,7 +146,7 @@ If you encounter issues, you can use the `debug.sh` script to collect system and
 ./debug.sh
 ```
 
-This will create a `gsmm-debug.log` file in the current directory containing detailed information for troubleshooting.
+This will create a `gmm-debug.log` file in the current directory containing detailed information for troubleshooting.
 
 ---
 
