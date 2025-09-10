@@ -11,9 +11,19 @@ startup_cleanup() {
     # Find all managed symlink directories
     local -a managed_dirs=()
     if [[ -n "$SYMLINK_DIR" ]] && [[ -d "$SYMLINK_DIR" ]]; then
-        # This is a simple heuristic. It assumes that any directory in the SYMLINK_DIR
-        # that contains a symlink named "Internal" is a managed directory.
-        mapfile -t managed_dirs < <(find "$SYMLINK_DIR" -maxdepth 2 -type l -name "$INTERNAL_STORAGE_NAME" -printf '%h\n' 2>/dev/null)
+        # Improved heuristic: Find directories that contain a symlink with the exact name
+        # of INTERNAL_STORAGE_NAME and verify its target is under a valid mount point.
+        while IFS= read -r -d '' dir; do
+            local symlink_path="$dir/$INTERNAL_STORAGE_NAME"
+            if [[ -L "$symlink_path" ]]; then
+                local target
+                target=$(readlink -f "$symlink_path" 2>/dev/null)
+                # Check if target is under MOUNT_ROOT
+                if [[ "$target" == "$MOUNT_ROOT"/* ]]; then
+                    managed_dirs+=("$dir")
+                fi
+            fi
+        done < <(find "$SYMLINK_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
     fi
 
     if [[ ${#managed_dirs[@]} -eq 0 ]]; then
@@ -44,7 +54,7 @@ startup_cleanup() {
         if [[ "$dir_basename" != "$current_device_sanitized_name" ]]; then
             local device_to_cleanup="$old_device_name"
             local sanitized_to_cleanup="$dir_basename"
-
+            
             cleanup_device_artifacts "$device_to_cleanup" "$sanitized_to_cleanup"
         fi
     done
@@ -52,6 +62,9 @@ startup_cleanup() {
 
 cleanup() {
     log "INFO" "GSConnect Mount Manager is shutting down."
+    # Explicitly unlock the file descriptor before removing the lock file
+    # This helps prevent potential race conditions.
+    flock -u 200 2>/dev/null || true
     rm -f "$LOCK_FILE"
     exit 0
 }

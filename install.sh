@@ -84,11 +84,13 @@ create_default_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         info "Creating default configuration file..."
         cat >"$CONFIG_FILE" <<'EOF'
-POLL_INTERVAL=3
-MOUNT_STRUCTURE_DIR="$HOME"
-LOG_LEVEL="INFO"
-ENABLE_BOOKMARKS=true
-EOF
+        POLL_INTERVAL=3
+        MOUNT_STRUCTURE_DIR="$HOME"
+        LOG_LEVEL="INFO"
+        MAX_LOG_SIZE=1024
+        LOG_ROTATE_COUNT=5
+        ENABLE_BOOKMARKS=true
+        EOF
         info "Default configuration created at $CONFIG_FILE"
     else
         warn "Configuration file already exists. Skipping creation."
@@ -103,7 +105,7 @@ copy_script() {
         error "Source script not found at $SOURCE_SCRIPT_PATH"
         exit 1
     fi
-    cat "$SOURCE_SCRIPT_PATH" > "$DEST_SCRIPT_PATH" || {
+    cp "$SOURCE_SCRIPT_PATH" "$DEST_SCRIPT_PATH" || {
         error "Failed to copy script to $DEST_SCRIPT_PATH"
         exit 1
     }
@@ -118,7 +120,7 @@ copy_script() {
         error "Library script not found at $SOURCE_LIB_PATH"
         exit 1
     fi
-    cat "$SOURCE_LIB_PATH" > "$DEST_LIB_PATH" || {
+    cp "$SOURCE_LIB_PATH" "$DEST_LIB_PATH" || {
         error "Failed to copy library to $DEST_LIB_PATH"
         exit 1
     }
