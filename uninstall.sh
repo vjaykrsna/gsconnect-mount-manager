@@ -11,16 +11,30 @@ SERVICE_NAME="gmm.service"
 SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
 LOCK_FILE="/tmp/gmm.lock"
 SCRIPT_PATH="$CONFIG_DIR/gmm-main.sh"
+CONFIG_FILE="$CONFIG_DIR/gmm.conf"
 
-# --- Colors for output ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+# Source the library for shared functions
+if [[ -f "$CONFIG_DIR/gmm-lib.sh" ]]; then
+    source "$CONFIG_DIR/gmm-lib.sh"
+elif [[ -f "./gmm-lib.sh" ]]; then
+    source "./gmm-lib.sh"
+else
+    # Fallback logging functions if library not found
+    info()  { echo "[INFO]  $*"; }
+    warn()  { echo "[WARN]  $*"; }
+    error() { echo "[ERROR] $*"; }
+    exit 1
+fi
 
-info()  { printf "%b[INFO] %s%b\n"  "$GREEN" "$*" "$NC"; }
-warn()  { printf "%b[WARN] %s%b\n"  "$YELLOW" "$*" "$NC"; }
-error() { printf "%b[ERROR] %s%b\n" "$RED" "$*" "$NC"; }
+# Override LOG_FILE for uninstaller - use a location that won't be removed
+LOG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gmm-uninstall.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+
+# Simple logging functions that use the shared log function
+info() { log "INFO"  "$*"; }
+warn()  { log "WARN"  "$*"; }
+error() { log "ERROR" "$*"; }
 
 # --- Functions ---
 stop_and_disable_service() {
@@ -31,11 +45,11 @@ stop_and_disable_service() {
 
     info "Stopping and disabling systemd user service..."
     if systemctl --user cat "$SERVICE_NAME" >/dev/null 2>&1; then
-        systemctl --user stop "$SERVICE_NAME" || warn "Service was not running."
-        systemctl --user disable "$SERVICE_NAME" || warn "Service was not enabled."
-        info "Service stopped and disabled."
+        systemctl --user stop "$SERVICE_NAME" || warn "Service $SERVICE_NAME was not running."
+        systemctl --user disable "$SERVICE_NAME" || warn "Service $SERVICE_NAME was not enabled."
+        info "Service $SERVICE_NAME stopped and disabled."
     else
-        warn "Service not found. It might have been already removed."
+        warn "Service $SERVICE_NAME not found. It might have been already removed."
     fi
 }
 
@@ -48,11 +62,35 @@ remove_service_file() {
     fi
 }
 
+remove_symlink() {
+    local symlink_path="$HOME/.config/systemd/user/default.target.wants/$SERVICE_NAME"
+    if [[ -L "$symlink_path" ]]; then
+        info "Removing systemd service symlink..."
+        rm -f "$symlink_path"
+        info "Symlink removed: $symlink_path"
+    else
+        warn "Systemd service symlink not found: $symlink_path"
+    fi
+}
+
 remove_config_directory() {
     if [[ -d "$CONFIG_DIR" ]]; then
-        info "Removing configuration directory..."
-        rm -rf "$CONFIG_DIR"
-        info "Directory removed: $CONFIG_DIR"
+        # Extra safety: only remove if CONFIG_DIR is under XDG_CONFIG_HOME or $HOME
+        local canonical_config
+        if canonical_config=$(realpath -m "$CONFIG_DIR" 2>/dev/null); then
+            case "$canonical_config" in
+                "${XDG_CONFIG_HOME:-$HOME/.config}/gmm"*|"$HOME/.config/gmm"*)
+                    info "Removing configuration directory..."
+                    rm -rf -- "$CONFIG_DIR"
+                    info "Directory removed: $CONFIG_DIR"
+                    ;;
+                *)
+                    warn "Refusing to remove configuration directory outside allowed config paths: $CONFIG_DIR"
+                    ;;
+            esac
+        else
+            warn "Could not canonicalize $CONFIG_DIR; skipping removal."
+        fi
     fi
 }
 
@@ -88,8 +126,9 @@ main() {
     stop_and_disable_service
     run_script_cleanup
     remove_service_file
-    remove_config_directory
+    remove_symlink
     remove_lock_file
+    remove_config_directory
 
     info "-------------------------------------------------"
     info "Uninstallation complete!"

@@ -34,4 +34,9 @@ chmod +x debug.sh
 Send the link provided by the script, or attach the `gmm-debug.log` file along with your issue.
 
 **Additional context**
-Add any other context about the problem here.
+Add any other relevant context about the problem here, such as:
+- Steps to reproduce the behavior (if not already covered)
+- Expected behavior
+- Actual behavior (if different from the bug description)
+- Screenshots or video (if applicable)
+- Any recent changes to your system or GMM configuration

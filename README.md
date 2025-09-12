@@ -9,12 +9,11 @@ Automatically organizes and provides seamless access to your Android device stor
 ## Features
 
 * **🔄 Auto Mount/Unmount** – Detects device connections and handles setup/cleanup automatically.
-* **📁 Clean Organization** – Creates `~/Device-Name/` with organized storage folders.
-* **🔖 File Manager Integration** – Single bookmark per device with all storage types as subfolders.
+* **📁 Clean Organization** – Creates `~/Device-Name/` with organized storage folders and symlinks.
+* **🔖 File Manager Integration** – Creates direct SFTP bookmarks for each detected storage (Internal, External, USB-OTG) and local symlinks for easy access.
 * **💻 Terminal Access** – Direct symlinks to internal storage, SD cards, and USB OTG.
 * **📱 Multi-Storage Support** – Handles internal storage, SD cards, and USB OTG devices.
-* **🔔 Smart Notifications** – Desktop alerts for mount/unmount events.
-* **⚙️ Configurable** – Customize via config file (polling, paths, naming, etc.).
+* **⚙️ Configurable** – Customize via config file (polling, paths, etc.).
 * **🛡️ Safe & Reliable** – No GSConnect modifications; automatic error recovery.
 
 ---
@@ -62,48 +61,48 @@ chmod +x install.sh
 * **systemd** (user service management)
 * **Android device** with KDE Connect app installed
 
+### Dependencies (common packages)
+
+On most Linux distributions you should have these tools available; if not, install them from your package manager:
+
+* gdbus (part of glib)
+* gvfs / gio (GVFS backends for SFTP access)
+* systemd (user services) and journalctl
+* grep, sed, realpath, readlink
+
+Example (Debian/Ubuntu):
+
+```bash
+sudo apt install git dbus-user-session libglib2.0-bin gvfs-bin coreutils grep sed
+```
+
+Note: package names vary by distro (Fedora/Arch/Manjaro use different package names). Ensure `gdbus` and `gvfs` are installed so device discovery and mounts work reliably.
+
 ---
 
 ## Configuration
 
-Edit `~/.config/gmm/config.conf` and restart the service:
+Edit `~/.config/gmm/gmm.conf` and restart the service:
 
 ```bash
-systemctl --user restart gmm
+systemctl --user restart gmm.service
 ```
 
-### General Settings
+### Essential Settings
 
-* `POLL_INTERVAL` – Check interval for device connections (seconds).
-* `MOUNT_STRUCTURE_DIR` – Where device folders are created (e.g., `~/Devices`).
-* `ENABLE_NOTIFICATIONS` – `true` or `false`.
+* `POLL_INTERVAL` – Check interval for device connections (seconds). Default: 3
+* `MOUNT_STRUCTURE_DIR` – Where device folders are created. Default: `$HOME`
+* `LOG_LEVEL` – Logging verbosity: `DEBUG`, `INFO`, `WARN`, `ERROR`. Default: `INFO`
 
-### Naming & Symlinks
+### Storage Paths
 
-* `SYMLINK_DIR` – Directory to create symlinks in (defaults to `MOUNT_STRUCTURE_DIR`).
-* `SYMLINK_PREFIX` / `SYMLINK_SUFFIX` – Add text before/after device name.
-* `INTERNAL_STORAGE_NAME` – Folder name for internal storage.
-* `EXTERNAL_STORAGE_NAME` – Base name for SD cards.
-* `USB_STORAGE_NAME` – Base name for USB-OTG.
-* `DETECT_GVFS_PATH` – Automatically detect GVFS mount path.
-* `ENABLE_BOOKMARKS` – `true` or `false` to enable/disable GTK bookmarks.
-* `BOOKMARK_FILE` – Path to the GTK bookmarks file.
+*   `INTERNAL_STORAGE_PATHS` – Comma-separated list of internal storage paths on your Android device (e.g., `/storage/emulated/0`). Default: `/storage/emulated/0`
+*   `EXTERNAL_STORAGE_PATHS` – Comma-separated list of external storage (SD card) paths. Default: (empty)
+*   `USB_STORAGE_PATHS` – Comma-separated list of USB OTG storage paths. Default: (empty)
 
-### Storage Detection
+### Bookmark Settings
 
-* `ENABLE_INTERNAL_STORAGE` – `true` to mount internal storage.
-* `ENABLE_EXTERNAL_STORAGE` – `true` for SD/USB detection.
-* `INTERNAL_STORAGE_PATH` – Path to internal storage on device.
-* `EXTERNAL_STORAGE_PATTERNS` – Patterns to find external storage.
-* `MAX_EXTERNAL_STORAGE` – Maximum external drives to mount.
-* `STORAGE_TIMEOUT` – Time to wait for storage to appear (seconds).
-
-### Logging & Cleanup
-
-* `LOG_LEVEL` – `DEBUG`, `INFO`, `WARN`, `ERROR`.
-* `MAX_LOG_SIZE` – Max log size (MB).
-* `LOG_ROTATE_COUNT` – Number of old log files to keep.
-* `AUTO_CLEANUP` – `true` to remove broken symlinks automatically.
+*   `ENABLE_BOOKMARKS` – Enable/disable GTK bookmarks. Default: `true`
 
 ---
 
@@ -132,21 +131,33 @@ Stops the service, removes files, and cleans bookmarks.
 ## Troubleshooting
 
 * **Device not detected:** Check GSConnect is installed and paired; enable file sharing.
-* **Bookmarks missing:** Verify the `~/Device-Name/` directory (or your custom `MOUNT_STRUCTURE_DIR`) exists and its symlinks are valid.
-* **Service issues:** `journalctl --user -u gmm -n 20` and restart the service.
-* **Storage not detected:** Ensure `DETECT_GVFS_PATH` is enabled and patterns match your device.
+*   **Bookmarks missing or incorrect:** Check `~/.config/gtk-3.0/bookmarks` directly. Ensure the `gmm.service` is running and your device is connected.
+*   **Service issues:** Check logs with `journalctl --user -u gmm -n 20` and try restarting the service.
+*   **Storage not detected:** Verify your `INTERNAL_STORAGE_PATHS`, `EXTERNAL_STORAGE_PATHS`, and `USB_STORAGE_PATHS` in `~/.config/gmm/gmm.conf` are correct and the paths exist on your device.
 
 ---
 
 ## Debugging
 
-If you encounter issues, you can use the `debug.sh` script to collect system and application information.
+If you encounter issues, use the `debug.sh` script to collect comprehensive system and application information.
 
 ```bash
+# If you have the repository cloned:
+./debug.sh
+
+# Or, download and run directly:
+curl -fsSL https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main/debug.sh -o debug.sh
+chmod +x debug.sh
 ./debug.sh
 ```
 
-This will create a `gmm-debug.log` file in the current directory containing detailed information for troubleshooting.
+The script will:
+*   Collect system information, GSConnect/KDE Connect status, and GMM configuration.
+*   Temporarily enable `DEBUG` logging to capture detailed runtime logs.
+*   Upload the collected `gmm-debug.log` to a paste service and provide a shareable link.
+*   Restore your original GMM configuration.
+
+**Always share the link provided by `debug.sh` when reporting issues.**
 
 ---
 

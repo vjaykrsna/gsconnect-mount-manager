@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_NAME="gmm-main.sh"
 LIB_SCRIPT_NAME="gmm-lib.sh"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gmm"
-CONFIG_FILE="$CONFIG_DIR/config.conf"
+CONFIG_FILE="$CONFIG_DIR/gmm.conf"
 SERVICE_NAME="gmm.service"
 SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
 SOURCE_SCRIPT_PATH="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/$SCRIPT_NAME"
@@ -17,38 +17,21 @@ SOURCE_LIB_PATH="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/$LIB_SCRIPT_NAME"
 DEST_SCRIPT_PATH="$CONFIG_DIR/$SCRIPT_NAME"
 DEST_LIB_PATH="$CONFIG_DIR/$LIB_SCRIPT_NAME"
 
-# --- Colors for output ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+# Source the library for shared functions
+source "$SOURCE_LIB_PATH"
 
-LOG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gmm/gmm.log"
+# Override LOG_FILE for installer - use a location that won't conflict with uninstall
+LOG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gmm-install.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
 
-info() {
-    local msg="$*"
-    printf "%b[INFO] %s%b\n" "$GREEN" "$msg" "$NC"      # colored output
-    printf "[INFO] %s\n" "$msg" >> "$LOG_FILE"           # plain log
-}
-
-warn() {
-    local msg="$*"
-    printf "%b[WARN] %s%b\n" "$YELLOW" "$msg" "$NC"
-    printf "[WARN] %s\n" "$msg" >> "$LOG_FILE"
-}
-
-error() {
-    local msg="$*"
-    printf "%b[ERROR] %s%b\n" "$RED" "$msg" "$NC"
-    printf "[ERROR] %s\n" "$msg" >> "$LOG_FILE"
-}
+# Simple logging functions that use the shared log function
+info() { log "INFO"  "$*"; }
+warn()  { log "WARN"  "$*"; }
+error() { log "ERROR" "$*"; }
 # --- Functions ---
 check_dependencies() {
-    info "Checking dependencies..."
-    
-    local deps=(systemctl bash mkdir cp chmod flock sed grep gio)
+    local deps=(systemctl bash mkdir cp chmod flock sed grep gdbus gio)
     local missing=()
     
     for cmd in "${deps[@]}"; do
@@ -59,7 +42,7 @@ check_dependencies() {
     
     if [[ ${#missing[@]} -gt 0 ]]; then
         for cmd in "${missing[@]}"; do
-            error "Required command not found: $cmd"
+            error "Required command not found: $cmd (needed for installation)"
         done
         error "Please install the missing dependencies and try again."
         exit 1
@@ -69,7 +52,6 @@ check_dependencies() {
 }
 
 create_config_dir() {
-    info "Creating configuration directory..."
     if [[ ! -d "$CONFIG_DIR" ]]; then
         mkdir -p "$CONFIG_DIR"
         info "Created directory: $CONFIG_DIR"
@@ -82,15 +64,22 @@ create_default_config() {
     create_config_dir  # ensure the directory exists
     
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        info "Creating default configuration file..."
-        cat >"$CONFIG_FILE" <<'EOF'
-        POLL_INTERVAL=3
-        MOUNT_STRUCTURE_DIR="$HOME"
-        LOG_LEVEL="INFO"
-        MAX_LOG_SIZE=1024
-        LOG_ROTATE_COUNT=5
-        ENABLE_BOOKMARKS=true
-        EOF
+    cat >"$CONFIG_FILE" <<'EOF'
+POLL_INTERVAL=3
+MOUNT_STRUCTURE_DIR="$HOME"
+LOG_LEVEL="INFO"
+MAX_LOG_SIZE=1024
+LOG_ROTATE_COUNT=5
+ENABLE_BOOKMARKS=true
+
+# --- Android Storage Paths ---
+# These paths are the ONLY storage locations that will be detected and symlinked.
+# Add common internal, external, and USB storage paths here.
+# Paths are comma-separated
+INTERNAL_STORAGE_PATHS="/storage/emulated/0"
+EXTERNAL_STORAGE_PATHS=""
+USB_STORAGE_PATHS=""
+EOF
         info "Default configuration created at $CONFIG_FILE"
     else
         warn "Configuration file already exists. Skipping creation."
@@ -158,7 +147,6 @@ EOF
         exit 1
     }
 
-    info "Enabling and starting the service..."
     systemctl --user enable --now "$SERVICE_NAME" || {
         error "Failed to enable/start service"
         exit 1
@@ -181,8 +169,6 @@ main() {
 
     info "-------------------------------------------------"
     info "Installation complete!"
-    info "The service is now running in the background."
-    info "To view logs, run: journalctl --user -u $SERVICE_NAME -f"
     info "To edit settings, modify: $CONFIG_FILE"
     info "-------------------------------------------------"
 }

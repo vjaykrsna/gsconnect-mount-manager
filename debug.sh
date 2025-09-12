@@ -6,19 +6,36 @@ set -euo pipefail
 
 # --- Configuration ---
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gmm"
-CONFIG_FILE="$CONFIG_DIR/config.conf"
+CONFIG_FILE="$CONFIG_DIR/gmm.conf"
 SERVICE_NAME="gmm.service"
 DEBUG_LOG="gmm-debug.log"
 
-# --- Colors ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+# Source the library for shared functions
+if [[ -f "./gmm-lib.sh" ]]; then
+    source "./gmm-lib.sh"
+else
+    # Fallback logging functions if library not found
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    NC='\033[0m'
+    log() {
+        local level="$1" message="$2"
+        local color=""
+        case "$level" in
+            "DEBUG") color="$BLUE" ;;
+            "INFO")  color="$GREEN" ;;
+            "WARN")  color="$YELLOW" ;;
+            "ERROR") color="$RED" ;;
+        esac
+        printf "%b[%s] %s%b\n" "$color" "$level" "$message" "$NC"
+    }
+fi
 
-info() { printf "%b[INFO]%b %s\n" "$GREEN" "$NC" "$*"; }
-warn() { printf "%b[WARN]%b %s\n" "$YELLOW" "$NC" "$*"; }
-error() { printf "%b[ERROR]%b %s\n" "$RED" "$NC" "$*"; }
+# Simple logging functions that use the shared log function
+info() { log "INFO"  "$*"; }
+warn()  { log "WARN"  "$*"; }
+error() { log "ERROR" "$*"; }
 
 # --- Cleanup Function ---
 cleanup() {
@@ -63,7 +80,7 @@ main() {
         echo "--- System Information ---"
         uname -a
         echo "Distro: $(lsb_release -ds 2>/dev/null || cat /etc/*release 2>/dev/null | head -n1 || echo 'Unknown')"
-        echo "Desktop: $XDG_CURRENT_DESKTOP ($GDMSESSION)"
+        echo "Desktop: $XDG_CURRENT_DESKTOP ($GDMSESSION) (Session: $XDG_SESSION_DESKTOP)"
         echo "User: $(whoami) (ID: $(id -u))"
         echo
         echo "--- Environment ---"
@@ -74,7 +91,7 @@ main() {
     # --- Dependencies ---
     {
         echo "--- Dependencies Check ---"
-        for cmd in systemctl gio dconf find gdbus; do
+        for cmd in systemctl gio dconf gdbus grep; do
             printf "% -15s: %s\n" "$cmd" "$(command -v "$cmd" || echo 'NOT FOUND')"
         done
         echo
@@ -103,6 +120,61 @@ main() {
             cat "$CONFIG_FILE"
         else
             echo "Configuration file not found."
+        fi
+        echo
+        if [[ -f "./gmm-lib.sh" ]]; then
+            source "./gmm-lib.sh"
+            load_config
+            printf "MOUNT_ROOT=%s\n" "${MOUNT_ROOT:-}"
+            printf "MOUNT_STRUCTURE_DIR=%s\n" "${MOUNT_STRUCTURE_DIR:-}"
+            printf "SYMLINK_DIR=%s\n" "${SYMLINK_DIR:-}"
+            printf "BOOKMARK_FILE=%s\n" "${BOOKMARK_FILE:-}"
+            printf "LOG_FILE=%s\n" "${CONFIG_DIR:-}/gmm.log"
+            printf "ENABLE_BOOKMARKS=%s\n" "${ENABLE_BOOKMARKS:-}"
+            printf "INTERNAL_STORAGE_PATHS=%s\n" "${INTERNAL_STORAGE_PATHS:-}"
+            printf "EXTERNAL_STORAGE_PATHS=%s\n" "${EXTERNAL_STORAGE_PATHS:-}"
+            printf "USB_STORAGE_PATHS=%s\n" "${USB_STORAGE_PATHS:-}"
+        else
+            echo "gmm-lib.sh not found; cannot resolve configuration." 
+        fi
+        echo
+    } >> "$DEBUG_LOG"
+
+    # --- GMM State and Created Artifacts ---
+    {
+        echo "--- GVFS Mount Point Status ---"
+        if [[ -d "${MOUNT_ROOT:-}" ]]; then
+            ls -l "${MOUNT_ROOT:-}"
+        else
+            echo "GVFS mount directory not found at ${MOUNT_ROOT:-}"
+        fi
+        echo
+
+        echo "--- GTK Bookmarks File ---"
+        if [[ -f "${BOOKMARK_FILE:-}" ]]; then
+            cat "${BOOKMARK_FILE:-}"
+        else
+            echo "Bookmark file not found at ${BOOKMARK_FILE:-}"
+        fi
+        echo
+
+        echo "--- Managed Devices Log ---"
+        MANAGED_DEVICES_LOG="$CONFIG_DIR/managed_devices.log"
+        if [[ -f "$MANAGED_DEVICES_LOG" ]]; then
+            cat "$MANAGED_DEVICES_LOG"
+        else
+            echo "Managed devices log not found."
+        fi
+        echo
+
+        echo "--- Created Device Directories ---"
+        if [[ -d "${MOUNT_STRUCTURE_DIR:-}" ]]; then
+            find "${MOUNT_STRUCTURE_DIR:-}" -maxdepth 2 -type d -name "*_*" 2>/dev/null | while read -r dir; do
+                echo "Found directory: $dir"
+                ls -l "$dir"
+            done
+        else
+            echo "Mount structure directory not found at ${MOUNT_STRUCTURE_DIR:-}"
         fi
         echo
     } >> "$DEBUG_LOG"
