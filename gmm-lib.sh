@@ -32,6 +32,7 @@ BOOKMARK_FILE="${BOOKMARK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/gtk-3.0/bookma
 INTERNAL_STORAGE_PATHS="${INTERNAL_STORAGE_PATHS:-/storage/emulated/0}"
 EXTERNAL_STORAGE_PATHS="${EXTERNAL_STORAGE_PATHS:-}"
 USB_STORAGE_PATHS="${USB_STORAGE_PATHS:-}"
+GMM_BACKEND="${GMM_BACKEND:-auto}" # auto, gsconnect, or kdeconnect
 
 # Generic log rotation function
 # Parameters: log_file_path, max_size_kb, rotate_count, [use_log_function]
@@ -229,40 +230,76 @@ get_host_from_mount() {
     [[ "$mount_path" =~ sftp:host=([^,]+) ]] && echo "${BASH_REMATCH[1]}" || echo ""
 }
 
-get_device_name_from_dbus() {
-    local device_path
-    # Use portable extraction (avoid grep -P dependency)
-    # Use timeout to prevent hanging on unresponsive DBus
-    if ! device_path=$(timeout 5 gdbus call --session \
-        --dest org.gnome.Shell.Extensions.GSConnect \
-        --object-path /org/gnome/Shell/Extensions/GSConnect \
-        --method org.freedesktop.DBus.ObjectManager.GetManagedObjects 2>/dev/null | \
-        grep -o '/org/gnome/Shell/Extensions/GSConnect/Device/[a-z0-9]\+' | head -n 1); then
-        log "WARN" "Timeout or error while getting device path from DBus"
+detect_backend() {
+    if [[ "$GMM_BACKEND" == "gsconnect" ]] || [[ "$GMM_BACKEND" == "kdeconnect" ]]; then
+        echo "$GMM_BACKEND"
         return
     fi
 
-    if [[ -z "$device_path" ]]; then
-        log "DEBUG" "No GSConnect device path found via DBus."
-        return
-    fi
-
-    local gdbus_output
-    # Use timeout to prevent hanging on unresponsive DBus
-    if ! gdbus_output=$(timeout 5 gdbus call --session \
-        --dest org.gnome.Shell.Extensions.GSConnect \
-        --object-path "$device_path" \
-        --method org.freedesktop.DBus.Properties.Get "org.gnome.Shell.Extensions.GSConnect.Device" "Name" 2>/dev/null); then
-        log "ERROR" "Timeout or failed to get device name from DBus for path: $device_path"
-        return
-    fi
-    
-    local device_name=""
-    # gdbus may return a quoted string (single or double quotes) or angle brackets with quotes
-    if [[ "$gdbus_output" =~ \<\'([^\']+)\'\> ]] || [[ "$gdbus_output" =~ ['"]([^'"]*)['"] ]]; then
-        device_name="${BASH_REMATCH[1]}"
+    # Auto-detection: Check for DBus services
+    if gdbus introspect --session --dest org.gnome.Shell.Extensions.GSConnect --object-path /org/gnome/Shell/Extensions/GSConnect >/dev/null 2>&1; then
+        echo "gsconnect"
+    elif gdbus introspect --session --dest org.kde.kdeconnect --object-path /modules/kdeconnect >/dev/null 2>&1; then
+        echo "kdeconnect"
     else
-        log "WARN" "Could not extract device name from gdbus output: $gdbus_output"
+        echo "none"
+    fi
+}
+
+get_device_id_from_dbus() {
+    local backend="$1"
+    if [[ "$backend" == "kdeconnect" ]]; then
+        local device_ids_str
+        device_ids_str=$(timeout 5 gdbus call --session \
+            --dest org.kde.kdeconnect \
+            --object-path /modules/kdeconnect \
+            --method org.kde.kdeconnect.daemon.devices 2>/dev/null || echo "")
+        
+        if [[ -n "$device_ids_str" ]]; then
+            # Robustly parse: (['...'],)
+            echo "$device_ids_str" | sed -e "s/([['\"]//g" -e "s/['\"])],*//g" | head -n 1
+        fi
+    fi
+}
+
+get_device_name_from_dbus() {
+    local backend="$1"
+    local device_id="$2"
+    local device_name=""
+
+    if [[ "$backend" == "gsconnect" ]]; then
+        local device_path
+        device_path=$(timeout 5 gdbus call --session \
+            --dest org.gnome.Shell.Extensions.GSConnect \
+            --object-path /org/gnome/Shell/Extensions/GSConnect \
+            --method org.freedesktop.DBus.ObjectManager.GetManagedObjects 2>/dev/null | \
+            grep -o '/org/gnome/Shell/Extensions/GSConnect/Device/[a-z0-9]\+' | head -n 1)
+
+        if [[ -n "$device_path" ]]; then
+            local gdbus_output
+            gdbus_output=$(timeout 5 gdbus call --session \
+                --dest org.gnome.Shell.Extensions.GSConnect \
+                --object-path "$device_path" \
+                --method org.freedesktop.DBus.Properties.Get "org.gnome.Shell.Extensions.GSConnect.Device" "Name" 2>/dev/null)
+            
+            if [[ "$gdbus_output" =~ \<\'([^\']+)\'\> ]] || [[ "$gdbus_output" =~ ['"]([^'"]*)['"] ]]; then
+                device_name="${BASH_REMATCH[1]}"
+            fi
+        fi
+    elif [[ "$backend" == "kdeconnect" ]] && [[ -n "$device_id" ]]; then
+        local gdbus_output
+        gdbus_output=$(timeout 5 gdbus call --session \
+            --dest org.kde.kdeconnect \
+            --object-path "/modules/kdeconnect/devices/$device_id" \
+            --method org.freedesktop.DBus.Properties.Get "org.kde.kdeconnect.device" "name" 2>/dev/null)
+
+        if [[ "$gdbus_output" =~ \<\'([^\']+)\'\> ]] || [[ "$gdbus_output" =~ ['"]([^'"]*)['"] ]]; then
+            device_name="${BASH_REMATCH[1]}"
+        fi
+    fi
+
+    if [[ -z "$device_name" ]]; then
+        log "WARN" "Could not get device name from DBus for backend $backend"
     fi
 
     echo "$device_name"
@@ -301,6 +338,29 @@ discover_storage() {
     done
 
     printf '%s\n' "${storage_paths[@]}"
+}
+
+
+ensure_kdeconnect_mount() {
+    local backend="$1"
+    local device_id="$2"
+
+    if [[ "$backend" != "kdeconnect" ]] || [[ -z "$device_id" ]]; then
+        return
+    fi
+
+    local is_mounted
+    is_mounted=$(gdbus call --session --dest org.kde.kdeconnect \
+        --object-path "/modules/kdeconnect/devices/$device_id/sftp" \
+        --method org.kde.kdeconnect.device.sftp.isMounted 2>/dev/null || echo "(false,)")
+    
+    if [[ "$is_mounted" != "(true,)" ]]; then
+        log "INFO" "KDE Connect device not mounted. Attempting to mount..."
+        gdbus call --session --dest org.kde.kdeconnect \
+            --object-path "/modules/kdeconnect/devices/$device_id/sftp" \
+            --method org.kde.kdeconnect.device.sftp.mount >/dev/null 2>&1
+        sleep 2 # Give it a moment to mount
+    fi
 }
 
 create_symlinks() {

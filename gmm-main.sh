@@ -82,12 +82,22 @@ get_current_sftp_mount_point() {
 startup_cleanup() {
     log "INFO" "Performing startup cleanup..."
     
+    local backend=$(detect_backend)
+    if [[ "$backend" == "none" ]]; then
+        log "WARN" "No backend detected during startup cleanup."
+        return
+    fi
+
     local current_device_name=""
     local current_sanitized_name=""
     local mount_point=$(get_current_sftp_mount_point)
 
     if [[ -n "$mount_point" ]]; then
-        current_device_name=$(get_device_name_from_dbus)
+        local device_id=""
+        if [[ "$backend" == "kdeconnect" ]]; then
+            device_id=$(get_device_id_from_dbus "$backend")
+        fi
+        current_device_name=$(get_device_name_from_dbus "$backend" "$device_id")
         if [[ -n "$current_device_name" ]]; then
             current_sanitized_name=$(sanitize_name "$current_device_name")
         else
@@ -118,12 +128,18 @@ cleanup() {
 # Outputs: device_name, host, port (pipe-separated)
 get_device_details_from_mount() {
     local mount_point="$1"
+    local backend="$2"
     local device_name="" host="" port=""
 
     if [[ -n "$mount_point" ]]; then
         host=$(get_host_from_mount "$mount_point")
         [[ "$mount_point" =~ ,port=([0-9]+) ]] && port="${BASH_REMATCH[1]}"
-        device_name=$(get_device_name_from_dbus)
+        
+        local device_id=""
+        if [[ "$backend" == "kdeconnect" ]]; then
+            device_id=$(get_device_id_from_dbus "$backend")
+        fi
+        device_name=$(get_device_name_from_dbus "$backend" "$device_id")
         [[ -z "$device_name" ]] && device_name="$host"
     fi
     printf "%s|%s|%s" "$device_name" "$host" "$port"
@@ -148,11 +164,24 @@ main() {
     sleep 1
 
     while true; do
+        local backend=$(detect_backend)
+        if [[ "$backend" == "none" ]]; then
+            log "DEBUG" "No backend running, sleeping."
+            sleep "$POLL_INTERVAL"
+            continue
+        fi
+
+        if [[ "$backend" == "kdeconnect" ]]; then
+            local device_id=$(get_device_id_from_dbus "$backend")
+            if [[ -n "$device_id" ]]; then
+                ensure_kdeconnect_mount "$backend" "$device_id"
+            fi
+        fi
         local mount_point=$(get_current_sftp_mount_point)
         local device_name="" host="" port=""
 
         if [[ -n "$mount_point" ]]; then
-            IFS='|' read -r device_name host port <<< "$(get_device_details_from_mount "$mount_point")"
+            IFS='|' read -r device_name host port <<< "$(get_device_details_from_mount "$mount_point" "$backend")"
         fi
 
         local old_device_name old_sanitized_name old_host
