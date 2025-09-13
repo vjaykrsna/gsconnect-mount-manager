@@ -8,10 +8,10 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'  # No Color
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gmm"
+CONFIG_DIR="${CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gmm}"
 CONFIG_FILE="$CONFIG_DIR/gmm.conf"
 
-LOG_FILE="$CONFIG_DIR/gmm.log"
+LOG_FILE="${LOG_FILE:-$CONFIG_DIR/gmm.log}"
 LOCK_FILE="/tmp/gmm.lock"
 DEVICE_STATE_FILE="$CONFIG_DIR/.device_state"
 MANAGED_DEVICES_LOG="$CONFIG_DIR/managed_devices.log"
@@ -32,38 +32,83 @@ BOOKMARK_FILE="${BOOKMARK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/gtk-3.0/bookma
 INTERNAL_STORAGE_PATHS="${INTERNAL_STORAGE_PATHS:-/storage/emulated/0}"
 EXTERNAL_STORAGE_PATHS="${EXTERNAL_STORAGE_PATHS:-}"
 USB_STORAGE_PATHS="${USB_STORAGE_PATHS:-}"
-rotate_logs() {
-    if [[ ! -f "$LOG_FILE" ]]; then return 0; fi
+
+# Generic log rotation function
+# Parameters: log_file_path, max_size_kb, rotate_count, [use_log_function]
+# If use_log_function is true, uses log() function for output, otherwise uses printf
+rotate_log_file() {
+    local log_file="$1" max_size="$2" rotate_count="$3" use_log="${4:-false}"
+
+    if [[ ! -f "$log_file" ]]; then return 0; fi
 
     local size_kb
-    if ! size_kb=$(du -k "$LOG_FILE" 2>/dev/null | cut -f1) || ! [[ "$size_kb" =~ ^[0-9]+$ ]]; then
-        # Avoid calling log() here because rotate_logs may be invoked from log() itself
-        printf "[WARN] Failed to get log file size for rotation, skipping...\n" >&2
+    if ! size_kb=$(du -k "$log_file" 2>/dev/null | cut -f1) || ! [[ "$size_kb" =~ ^[0-9]+$ ]]; then
+        if [[ "$use_log" == "true" ]]; then
+            log "WARN" "Failed to get log file size for rotation, skipping..."
+        else
+            printf "[WARN] Failed to get log file size for rotation, skipping...\n" >&2
+        fi
         return 1
     fi
 
-    if [[ "$MAX_LOG_SIZE" -le 0 ]] || [[ "$LOG_ROTATE_COUNT" -le 0 ]]; then return 0; fi
+    if [[ "$max_size" -le 0 ]] || [[ "$rotate_count" -le 0 ]]; then return 0; fi
 
-    if [[ $size_kb -gt "$MAX_LOG_SIZE" ]]; then
-        printf "[INFO] Log file size (%s KB) exceeds max size (%s KB). Rotating logs.\n" "$size_kb" "$MAX_LOG_SIZE" >&2
-        for i in $(seq $((LOG_ROTATE_COUNT - 1)) -1 1); do
-            if [[ -f "$LOG_FILE.$i" ]]; then
-                if ! mv "$LOG_FILE.$i" "$LOG_FILE.$((i + 1))" 2>/dev/null; then
-                    printf "[ERROR] Failed to rotate log file %s\n" "$LOG_FILE.$i" >&2
+    if [[ $size_kb -gt "$max_size" ]]; then
+        if [[ "$use_log" == "true" ]]; then
+            log "INFO" "Log file size (%s KB) exceeds max size (%s KB). Rotating logs." "$size_kb" "$max_size"
+        else
+            printf "[INFO] Log file size (%s KB) exceeds max size (%s KB). Rotating logs.\n" "$size_kb" "$max_size" >&2
+        fi
+
+        for i in $(seq $((rotate_count - 1)) -1 1); do
+            if [[ -f "$log_file.$i" ]]; then
+                if ! mv "$log_file.$i" "$log_file.$((i + 1))" 2>/dev/null; then
+                    if [[ "$use_log" == "true" ]]; then
+                        log "ERROR" "Failed to rotate log file %s" "$log_file.$i"
+                    else
+                        printf "[ERROR] Failed to rotate log file %s\n" "$log_file.$i" >&2
+                    fi
                 fi
             fi
         done
-        if ! mv "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null; then
-            printf "[ERROR] Failed to move main log file to %s.1\n" "$LOG_FILE" >&2
+
+        if ! mv "$log_file" "$log_file.1" 2>/dev/null; then
+            if [[ "$use_log" == "true" ]]; then
+                log "ERROR" "Failed to move main log file to %s.1" "$log_file"
+            else
+                printf "[ERROR] Failed to move main log file to %s.1\n" "$log_file" >&2
+            fi
             return 1
         fi
-        if ! touch "$LOG_FILE" 2>/dev/null; then
-            printf "[ERROR] Failed to create new log file %s\n" "$LOG_FILE" >&2
+
+        if ! touch "$log_file" 2>/dev/null; then
+            if [[ "$use_log" == "true" ]]; then
+                log "ERROR" "Failed to create new log file %s" "$log_file"
+            else
+                printf "[ERROR] Failed to create new log file %s\n" "$log_file" >&2
+            fi
             return 1
         fi
-        printf "[INFO] Log rotation completed successfully.\n" >&2
+
+        if [[ "$use_log" == "true" ]]; then
+            log "INFO" "Log rotation completed successfully."
+        else
+            printf "[INFO] Log rotation completed successfully.\n" >&2
+        fi
     fi
     return 0
+}
+
+# Managed Devices Log Rotation
+MANAGED_DEVICES_LOG_MAX_SIZE="${MANAGED_DEVICES_LOG_MAX_SIZE:-100}" # in KB
+MANAGED_DEVICES_LOG_ROTATE_COUNT="${MANAGED_DEVICES_LOG_ROTATE_COUNT:-3}"
+
+rotate_logs() {
+    rotate_log_file "$LOG_FILE" "$MAX_LOG_SIZE" "$LOG_ROTATE_COUNT" "false"
+}
+
+rotate_managed_devices_log() {
+    rotate_log_file "$MANAGED_DEVICES_LOG" "$MANAGED_DEVICES_LOG_MAX_SIZE" "$MANAGED_DEVICES_LOG_ROTATE_COUNT" "true"
 }
 
 # Unified logging function with colored terminal output and file logging
@@ -72,7 +117,14 @@ rotate_logs() {
 log() {
     local level="$1" message="$2"
 
-    rotate_logs || log "WARN" "Log rotation failed, continuing..."
+    # Only attempt log rotation if not already in a log rotation failure context
+    if [[ -z "${_GMM_LOG_ROTATION_IN_PROGRESS:-}" ]]; then
+        if ! rotate_logs; then
+            # Set flag to prevent recursive log rotation attempts
+            _GMM_LOG_ROTATION_IN_PROGRESS=1 log "WARN" "Log rotation failed, continuing..."
+            unset _GMM_LOG_ROTATION_IN_PROGRESS
+        fi
+    fi
 
     local levels=("DEBUG" "INFO" "WARN" "ERROR")
     local current_level_idx=1 level_idx=1
@@ -136,23 +188,37 @@ load_config() {
 sanitize_name() {
     local name="$1"
 
+    # Handle empty input
     if [[ -z "$name" ]]; then
         log "ERROR" "Empty device name provided to sanitize_name, defaulting to 'unknown_device'"
         echo "unknown_device"
         return
     fi
 
+    # Replace invalid characters with underscores
     name="${name//[^a-zA-Z0-9._-]/_}"
 
-    if [[ -z "${name//_/}" ]]; then
-        log "ERROR" "Device name became empty after sanitization, defaulting to 'unknown_device'"
+    # Check if name became empty or contains only underscores/spaces after sanitization
+    local cleaned_name="${name//_/}"
+    cleaned_name="${cleaned_name// /}"
+    if [[ -z "$cleaned_name" ]]; then
+        log "ERROR" "Device name '$1' became invalid after sanitization (contains only invalid characters), defaulting to 'unknown_device'"
         echo "unknown_device"
         return
     fi
 
+    # Truncate if too long
     if [[ ${#name} -gt 128 ]]; then
         log "WARN" "Device name too long (${#name} chars), truncating to 128 characters"
         name="${name:0:128}"
+        # Re-check if truncated name is still valid
+        cleaned_name="${name//_/}"
+        cleaned_name="${cleaned_name// /}"
+        if [[ -z "$cleaned_name" ]]; then
+            log "WARN" "Truncated device name became invalid, using fallback"
+            echo "unknown_device"
+            return
+        fi
     fi
 
     echo "$name"
@@ -166,26 +232,37 @@ get_host_from_mount() {
 get_device_name_from_dbus() {
     local device_path
     # Use portable extraction (avoid grep -P dependency)
-    device_path=$(gdbus call --session \
+    # Use timeout to prevent hanging on unresponsive DBus
+    if ! device_path=$(timeout 5 gdbus call --session \
         --dest org.gnome.Shell.Extensions.GSConnect \
         --object-path /org/gnome/Shell/Extensions/GSConnect \
         --method org.freedesktop.DBus.ObjectManager.GetManagedObjects 2>/dev/null | \
-        grep -o '/org/gnome/Shell/Extensions/GSConnect/Device/[a-z0-9]\+' | head -n 1)
+        grep -o '/org/gnome/Shell/Extensions/GSConnect/Device/[a-z0-9]\+' | head -n 1); then
+        log "WARN" "Timeout or error while getting device path from DBus"
+        return
+    fi
 
-    if [[ -z "$device_path" ]]; then return; fi
+    if [[ -z "$device_path" ]]; then
+        log "DEBUG" "No GSConnect device path found via DBus."
+        return
+    fi
 
     local gdbus_output
-    gdbus_output=$(gdbus call --session \
+    # Use timeout to prevent hanging on unresponsive DBus
+    if ! gdbus_output=$(timeout 5 gdbus call --session \
         --dest org.gnome.Shell.Extensions.GSConnect \
         --object-path "$device_path" \
-        --method org.freedesktop.DBus.Properties.Get "org.gnome.Shell.Extensions.GSConnect.Device" "Name" 2>/dev/null)
+        --method org.freedesktop.DBus.Properties.Get "org.gnome.Shell.Extensions.GSConnect.Device" "Name" 2>/dev/null); then
+        log "ERROR" "Timeout or failed to get device name from DBus for path: $device_path"
+        return
+    fi
     
     local device_name=""
-    if [[ "$gdbus_output" =~ '"' ]]; then
-        # gdbus may return a quoted string, fallback to extracting single-quoted
-        [[ "$gdbus_output" =~ '"([^"]*)"' ]] && device_name="${BASH_REMATCH[1]}"
+    # gdbus may return a quoted string (single or double quotes) or angle brackets with quotes
+    if [[ "$gdbus_output" =~ \<\'([^\']+)\'\> ]] || [[ "$gdbus_output" =~ ['"]([^'"]*)['"] ]]; then
+        device_name="${BASH_REMATCH[1]}"
     else
-        [[ "$gdbus_output" =~ \'([^\']*)\' ]] && device_name="${BASH_REMATCH[1]}"
+        log "WARN" "Could not extract device name from gdbus output: $gdbus_output"
     fi
 
     echo "$device_name"
@@ -194,42 +271,34 @@ get_device_name_from_dbus() {
 discover_storage() {
     local mount_point="$1"
     local -a storage_paths=()
+    local -A storage_types=(
+        ["INTERNAL_STORAGE_PATHS"]="internal:Internal"
+        ["EXTERNAL_STORAGE_PATHS"]="external:External"
+        ["USB_STORAGE_PATHS"]="usb:USB-OTG"
+    )
 
+    log "DEBUG" "Discovering storage for mount point: $mount_point"
 
-    log "DEBUG" "Storage paths - Internal: '${INTERNAL_STORAGE_PATHS}', External: '${EXTERNAL_STORAGE_PATHS}', USB: '${USB_STORAGE_PATHS}'"
+    for var_name in "${!storage_types[@]}"; do
+        local config_paths_str="${!var_name}"
+        local type_name="${storage_types[$var_name]%%:*}"
+        local display_name="${storage_types[$var_name]##*:}"
 
-    # Process internal storage
-    if [[ -n "$INTERNAL_STORAGE_PATHS" ]]; then
-        local full_path="$mount_point/$INTERNAL_STORAGE_PATHS"
-        if [[ -d "$full_path" ]]; then
-            storage_paths+=("internal:$full_path:Internal")
-            log "INFO" "Added internal storage: $full_path"
-        else
-            log "WARN" "Internal storage path not found: $full_path"
+        if [[ -n "$config_paths_str" ]]; then
+            # Split comma-separated paths
+            IFS=',' read -r -a paths_array <<< "$config_paths_str"
+            for path_segment in "${paths_array[@]}"; do
+                local full_path="$mount_point/$path_segment"
+                # Use timeout to prevent hanging on unresponsive network filesystems
+                if timeout 5 [ -d "$full_path" ] 2>/dev/null; then
+                    storage_paths+=("$type_name:$full_path:$display_name")
+                    log "INFO" "Added $type_name storage: $full_path (Display: $display_name)"
+                else
+                    log "WARN" "$type_name storage path not found or timeout: $full_path"
+                fi
+            done
         fi
-    fi
-    
-    # Process external storage
-    if [[ -n "$EXTERNAL_STORAGE_PATHS" ]]; then
-        local full_path="$mount_point/$EXTERNAL_STORAGE_PATHS"
-        if [[ -d "$full_path" ]]; then
-            storage_paths+=("external:$full_path:External")
-            log "INFO" "Added external storage: $full_path"
-        else
-            log "WARN" "External storage path not found: $full_path"
-        fi
-    fi
-    
-    # Process USB storage
-    if [[ -n "$USB_STORAGE_PATHS" ]]; then
-        local full_path="$mount_point/$USB_STORAGE_PATHS"
-        if [[ -d "$full_path" ]]; then
-            storage_paths+=("usb:$full_path:USB-OTG")
-            log "INFO" "Added USB storage: $full_path"
-        else
-            log "WARN" "USB storage path not found: $full_path"
-        fi
-    fi
+    done
 
     printf '%s\n' "${storage_paths[@]}"
 }
@@ -241,26 +310,26 @@ create_symlinks() {
     local symlink_created=false
 
     for info in "${storage_info[@]}"; do
-        # Expected format: type:path:name
+        # Expected format: type:path:display_name
         # Since path may contain colons, we need to parse carefully
         # Extract type (everything before the first colon)
         local type="${info%%:*}"
         local rest="${info#*:}"
-        # Extract name (everything after the last colon)
-        local name="${rest##*:}"
+        # Extract display_name (everything after the last colon)
+        local display_name="${rest##*:}"
         local path="${rest%:*}"
 
-        case "$type" in
-            internal) name="Internal" ;;
-            external) name="External" ;;
-            usb)      name="USB-OTG" ;;
-            *)        name="Storage" ;;
-        esac
+        # Use display_name from discover_storage, fallback if empty
+        if [[ -z "$display_name" ]]; then
+            case "$type" in
+                internal) display_name="Internal" ;;
+                external) display_name="External" ;;
+                usb)      display_name="USB-OTG" ;;
+                *)        display_name="Storage" ;;
+            esac
+        fi
 
-        # fallback name if empty
-        [[ -z "$name" ]] && name="Storage"
-
-        local link_target="$device_dir/$name"
+        local link_target="$device_dir/$display_name"
         if [[ -L "$link_target" ]]; then
             # existing symlink: check target and replace if different or broken
             local existing_target=$(readlink "$link_target" 2>/dev/null || true)
@@ -289,6 +358,35 @@ bookmarks_enabled() {
     [[ "$enabled" == true || "$enabled" == "1" ]]
 }
 
+# Validate bookmark file path for safety
+# Ensures the bookmark file is writable and within the user's config directory
+validate_bookmark_file() {
+    local bookmark_file="$1"
+
+    # Basic safety: ensure bookmark file is under user's config dir (canonical path check)
+    local bookmark_file_real allowed_config
+    bookmark_file_real=$(realpath -m "$bookmark_file" 2>/dev/null)
+    allowed_config=$(realpath -m "${XDG_CONFIG_HOME:-$HOME/.config}" 2>/dev/null)
+    if [[ -z "$bookmark_file_real" || -z "$allowed_config" ]]; then
+        log "ERROR" "Failed to resolve paths for bookmark file safety check."
+        return 1
+    fi
+
+    # Only allow writing inside the user's config directory, not just any subdirectory of $HOME
+    case "$bookmark_file_real" in
+        "$allowed_config"/*) ;;
+        "$allowed_config") ;;
+        *) log "ERROR" "Refusing to write bookmark file outside user config directory: $bookmark_file"; return 1 ;;
+    esac
+
+    if ! touch "$bookmark_file" 2>/dev/null; then
+        log "ERROR" "Bookmark file not writable: $bookmark_file"
+        return 1
+    fi
+
+    return 0
+}
+
 add_bookmark() {
     local device_name="$1" host="$2" port="$3"
     shift 3 # Shift off device_name, host, port
@@ -300,23 +398,9 @@ add_bookmark() {
         return
     fi
 
-    # Basic safety: ensure bookmark file is under user's config dir (canonical path check)
-    local bookmark_file_real allowed_config
-    bookmark_file_real=$(realpath -m "$BOOKMARK_FILE" 2>/dev/null)
-    allowed_config=$(realpath -m "${XDG_CONFIG_HOME:-$HOME/.config}" 2>/dev/null)
-    if [[ -z "$bookmark_file_real" || -z "$allowed_config" ]]; then
-        log "ERROR" "Failed to resolve paths for bookmark file safety check."
+    # Validate bookmark file safety
+    if ! validate_bookmark_file "$BOOKMARK_FILE"; then
         return
-    fi
-    # Only allow writing inside the user's config directory, not just any subdirectory of $HOME
-    case "$bookmark_file_real" in
-        "$allowed_config"/*) ;;
-        "$allowed_config") ;;
-        *) log "ERROR" "Refusing to write bookmark file outside user config directory: $BOOKMARK_FILE"; return ;;
-    esac
-
-    if ! touch "$BOOKMARK_FILE" 2>/dev/null; then
-        log "ERROR" "Bookmark file not writable: $BOOKMARK_FILE"; return;
     fi
 
     local sanitized_device_name=$(sanitize_name "$device_name")
@@ -362,19 +446,27 @@ remove_bookmark() {
         return
     fi
 
-    if [[ -f "$BOOKMARK_FILE" ]]; then
+    if [[ -f "$BOOKMARK_FILE" ]] && [[ "$BOOKMARK_FILE" != "/dev/null" ]]; then
         local sanitized_name=$(sanitize_name "$device_name")
-        sed -i "\| $sanitized_name$|d" "$BOOKMARK_FILE"
-        log "INFO" "Removed bookmark for $device_name"
+        
+        # Remove all bookmarks for this device
+        sed -i "\| $sanitized_name/|d" "$BOOKMARK_FILE"
+        
+        log "INFO" "Removed bookmarks for $device_name"
+    elif [[ "$BOOKMARK_FILE" == "/dev/null" ]]; then
+        log "DEBUG" "Bookmark file redirected to /dev/null, skipping bookmark removal"
+    else
+        log "DEBUG" "Bookmark file does not exist: $BOOKMARK_FILE"
     fi
-
 }
 
-cleanup_device_artifacts() {
+# Helper function for cleaning up device artifacts
+# Parameters: device_name, sanitized_name
+cleanup_single_device() {
     local device_name="$1" sanitized_name="$2"
 
     log "INFO" "Cleaning up artifacts for device: $device_name"
-    remove_bookmark "$device_name" ""
+    remove_bookmark "$device_name"
 
     if [[ -n "$sanitized_name" ]]; then
         local device_dir="$MOUNT_STRUCTURE_DIR/$sanitized_name"
@@ -385,8 +477,19 @@ cleanup_device_artifacts() {
             else
                 log "ERROR" "Safety validation failed for directory '$device_dir'. Aborting deletion."
             fi
+        elif [[ "$AUTO_CLEANUP" != true ]]; then
+            log "DEBUG" "Auto cleanup disabled. Skipping directory removal for: $device_dir"
+        elif [[ ! -d "$device_dir" ]]; then
+            log "DEBUG" "Device directory does not exist, nothing to remove: $device_dir"
         fi
+    else
+        log "DEBUG" "No sanitized name provided, skipping directory cleanup"
     fi
+}
+
+cleanup_device_artifacts() {
+    local device_name="$1" sanitized_name="$2"
+    cleanup_single_device "$device_name" "$sanitized_name"
 }
 
 uninstall_cleanup() {
@@ -400,18 +503,7 @@ uninstall_cleanup() {
     while IFS='|' read -r device_name sanitized_name host || [[ -n "$device_name" ]]; do
         if [[ " ${cleaned_entries[*]} " =~ " $sanitized_name " ]]; then continue; fi
 
-        log "INFO" "Cleaning up artifacts for device: $device_name"
-        remove_bookmark "$device_name" "$host"
-
-        local device_dir="$MOUNT_STRUCTURE_DIR/$sanitized_name"
-        if [[ -d "$device_dir" ]]; then
-            if validate_device_dir "$device_dir"; then
-                rm -rf -- "$device_dir"
-                log "INFO" "Removed directory: $device_dir"
-            else
-                log "ERROR" "Safety validation failed for directory '$device_dir' during uninstall. Aborting deletion for this entry."
-            fi
-        fi
+        cleanup_single_device "$device_name" "$sanitized_name"
         cleaned_entries+=("$sanitized_name")
     done < "$MANAGED_DEVICES_LOG"
 
@@ -437,14 +529,14 @@ validate_device_dir() {
     fi
 
     local canonical_device_dir
-    if ! canonical_device_dir=$(realpath -m "$device_dir" 2>/dev/null); then
-        log "ERROR" "Could not canonicalize device directory path: $device_dir"
+    if ! canonical_device_dir=$(timeout 5 realpath -m "$device_dir" 2>/dev/null); then
+        log "ERROR" "Timeout or could not canonicalize device directory path: $device_dir"
         return 1
     fi
 
     local canonical_base
-    if ! canonical_base=$(realpath -m "$MOUNT_STRUCTURE_DIR" 2>/dev/null); then
-        log "ERROR" "Could not canonicalize base directory path: $MOUNT_STRUCTURE_DIR"
+    if ! canonical_base=$(timeout 5 realpath -m "$MOUNT_STRUCTURE_DIR" 2>/dev/null); then
+        log "ERROR" "Timeout or could not canonicalize base directory path: $MOUNT_STRUCTURE_DIR"
         return 1
     fi
 

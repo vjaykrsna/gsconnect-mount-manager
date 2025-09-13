@@ -18,20 +18,16 @@ DEST_SCRIPT_PATH="$CONFIG_DIR/$SCRIPT_NAME"
 DEST_LIB_PATH="$CONFIG_DIR/$LIB_SCRIPT_NAME"
 
 # Source the library for shared functions
-source "$SOURCE_LIB_PATH"
-
 # Override LOG_FILE for installer - use a location that won't conflict with uninstall
 LOG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gmm-install.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
 
-# Simple logging functions that use the shared log function
-info() { log "INFO"  "$*"; }
-warn()  { log "WARN"  "$*"; }
-error() { log "ERROR" "$*"; }
+source "$SOURCE_LIB_PATH"
+
 # --- Functions ---
 check_dependencies() {
-    local deps=(systemctl bash mkdir cp chmod flock sed grep gdbus gio)
+    local deps=(systemctl bash mkdir cp chmod flock sed grep gdbus gio realpath timeout)
     local missing=()
     
     for cmd in "${deps[@]}"; do
@@ -42,21 +38,21 @@ check_dependencies() {
     
     if [[ ${#missing[@]} -gt 0 ]]; then
         for cmd in "${missing[@]}"; do
-            error "Required command not found: $cmd (needed for installation)"
+            log "ERROR" "Required command not found: $cmd (needed for installation)"
         done
-        error "Please install the missing dependencies and try again."
+        log "ERROR" "Please install the missing dependencies and try again."
         exit 1
     else
-        info "All dependencies are installed."
+        log "INFO" "All dependencies are installed."
     fi
 }
 
 create_config_dir() {
     if [[ ! -d "$CONFIG_DIR" ]]; then
         mkdir -p "$CONFIG_DIR"
-        info "Created directory: $CONFIG_DIR"
+        log "INFO" "Created directory: $CONFIG_DIR"
     else
-        info "Configuration directory already exists: $CONFIG_DIR"
+        log "INFO" "Configuration directory already exists: $CONFIG_DIR"
     fi
 }
 
@@ -80,49 +76,49 @@ INTERNAL_STORAGE_PATHS="/storage/emulated/0"
 EXTERNAL_STORAGE_PATHS=""
 USB_STORAGE_PATHS=""
 EOF
-        info "Default configuration created at $CONFIG_FILE"
+        log "INFO" "Default configuration created at $CONFIG_FILE"
     else
-        warn "Configuration file already exists. Skipping creation."
+        log "WARN" "Configuration file already exists. Skipping creation."
     fi
 }
 
 copy_script() {
-    info "Copying script files..."
+    log "INFO" "Copying script files..."
     
     # --- Copy Main Script ---
     if [[ ! -f "$SOURCE_SCRIPT_PATH" ]]; then
-        error "Source script not found at $SOURCE_SCRIPT_PATH"
+        log "ERROR" "Source script not found at $SOURCE_SCRIPT_PATH"
         exit 1
     fi
     cp "$SOURCE_SCRIPT_PATH" "$DEST_SCRIPT_PATH" || {
-        error "Failed to copy script to $DEST_SCRIPT_PATH"
+        log "ERROR" "Failed to copy script to $DEST_SCRIPT_PATH"
         exit 1
     }
     chmod +x "$DEST_SCRIPT_PATH" || {
-        error "Failed to make script executable"
+        log "ERROR" "Failed to make script executable"
         exit 1
     }
-    info "Main script copied to $DEST_SCRIPT_PATH"
+    log "INFO" "Main script copied to $DEST_SCRIPT_PATH"
 
     # --- Copy Library Script ---
     if [[ ! -f "$SOURCE_LIB_PATH" ]]; then
-        error "Library script not found at $SOURCE_LIB_PATH"
+        log "ERROR" "Library script not found at $SOURCE_LIB_PATH"
         exit 1
     fi
     cp "$SOURCE_LIB_PATH" "$DEST_LIB_PATH" || {
-        error "Failed to copy library to $DEST_LIB_PATH"
+        log "ERROR" "Failed to copy library to $DEST_LIB_PATH"
         exit 1
     }
-    info "Library script copied to $DEST_LIB_PATH"
+    log "INFO" "Library script copied to $DEST_LIB_PATH"
 }
 
 install_systemd_service() {
-    info "Installing systemd user service..."
+    log "INFO" "Installing systemd user service..."
 
     # Stop the service if it's already running to ensure a clean update
     if systemctl --user is-active --quiet "$SERVICE_NAME"; then
-        info "Service is running. Stopping it for update..."
-        systemctl --user stop "$SERVICE_NAME" || warn "Failed to stop the service. Continuing anyway."
+        log "INFO" "Service is running. Stopping it for update..."
+        systemctl --user stop "$SERVICE_NAME" || log "WARN" "Failed to stop the service. Continuing anyway."
     fi
 
     mkdir -p "$(dirname "$SERVICE_FILE")"
@@ -134,43 +130,45 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=$DEST_SCRIPT_PATH
-Restart=always
+Restart=on-failure
 RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
 
 [Install]
 WantedBy=default.target
 EOF
 
-    info "Reloading systemd user daemon..."
+    log "INFO" "Reloading systemd user daemon..."
     systemctl --user daemon-reload || {
-        error "Failed to reload systemd user daemon"
+        log "ERROR" "Failed to reload systemd user daemon"
         exit 1
     }
 
     systemctl --user enable --now "$SERVICE_NAME" || {
-        error "Failed to enable/start service"
+        log "ERROR" "Failed to enable/start service"
         exit 1
     }
 
-    info "Systemd service installed and started successfully"
+    log "INFO" "Systemd service installed and started successfully"
 }
 
 # --- Main Installation Logic ---
 main() {
+    # Add separator to log file
     printf -- '-%.0s' {1..50} >> "$LOG_FILE"
     printf "\n" >> "$LOG_FILE"
-    info "Starting GMM (GSConnect Mount Manager) installation..."
+    log "INFO" "Starting GMM (GSConnect Mount Manager) installation..."
 
     check_dependencies
-    create_config_dir
     create_default_config
     copy_script
     install_systemd_service
 
-    info "-------------------------------------------------"
-    info "Installation complete!"
-    info "To edit settings, modify: $CONFIG_FILE"
-    info "-------------------------------------------------"
+    log "INFO" "-------------------------------------------------"
+    log "INFO" "Installation complete!"
+    log "INFO" "To edit settings, modify: $CONFIG_FILE"
+    log "INFO" "-------------------------------------------------"
 }
 
 # Run the installer
