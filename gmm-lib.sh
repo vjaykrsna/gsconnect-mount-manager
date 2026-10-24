@@ -367,7 +367,6 @@ create_symlinks() {
     local device_dir="$1"
     shift
     local -a storage_info=("$@")
-    local symlink_created=false
 
     for info in "${storage_info[@]}"; do
         # Expected format: type:path:display_name
@@ -397,7 +396,6 @@ create_symlinks() {
                 rm -f "$link_target"
                 ln -s "$path" "$link_target"
                 log "INFO" "Replaced symlink: $link_target -> $path"
-                symlink_created=true
             else
                 log "DEBUG" "Symlink already correct: $link_target -> $path"
             fi
@@ -406,11 +404,8 @@ create_symlinks() {
         else
             ln -s "$path" "$link_target"
             log "INFO" "Created symlink: $link_target -> $path"
-            symlink_created=true
         fi
     done
-
-    [[ "$symlink_created" == true ]]
 }
 
 bookmarks_enabled() {
