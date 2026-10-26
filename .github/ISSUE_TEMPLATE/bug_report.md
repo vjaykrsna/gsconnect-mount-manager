@@ -10,33 +10,29 @@ assignees: ''
 **Describe the bug**
 A clear and concise description of what the bug is.
 
-**Run the debug script**
+**System & Diagnostic Output**
+Please run the following commands and paste the output:
+
 ```bash
-# Download and run the debug collector
-curl -fsSL https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main/debug.sh -o debug.sh
-chmod +x debug.sh
-./debug.sh
+# Diagnostic checks
+gmm doctor
+
+# Current daemon & mount status
+gmm status
+
+# Recent service logs (last 30 lines)
+journalctl --user -u gmm -n 30 --no-pager
 ```
 
-**Or if you have the repository cloned:**
-```bash
-./debug.sh
-```
+**Steps to Reproduce**
+1. Connect device '...'
+2. Trigger mount via '...'
+3. See error
 
-**What the debug script does:**
-- Collects comprehensive system information
-- Checks GSConnect/KDE Connect status
-- Temporarily enables DEBUG logging to capture detailed logs
-- Uploads the debug log to a paste service and provides a shareable link
-- Restores original configuration
-
-**Share the output:**
-Send the link provided by the script, or attach the `gmm-debug.log` file along with your issue.
+**Expected behavior**
+A clear and concise description of what you expected to happen.
 
 **Additional context**
-Add any other relevant context about the problem here, such as:
-- Steps to reproduce the behavior (if not already covered)
-- Expected behavior
-- Actual behavior (if different from the bug description)
-- Screenshots or video (if applicable)
-- Any recent changes to your system or GMM configuration
+- Linux Distribution & Desktop Environment (e.g. Ubuntu 26.04 GNOME, Arch KDE Plasma)
+- Mobile Integration backend: GSConnect or KDE Connect
+- Any custom configuration in `~/.config/gmm/config.toml`

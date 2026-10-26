@@ -1,2 +1,6 @@
-.roo/
-AGENTS.md
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.lock
+*.tmp

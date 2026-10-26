@@ -2,174 +2,174 @@
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# GSConnect Mount Manager Installer
+# GMM (GSConnect / KDE Connect Mount Manager) 2.0 Installer
 # -----------------------------------------------------------------------------
 
-# --- Configuration ---
-SCRIPT_NAME="gmm-main.sh"
-LIB_SCRIPT_NAME="gmm-lib.sh"
+BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gmm"
-CONFIG_FILE="$CONFIG_DIR/gmm.conf"
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SERVICE_NAME="gmm.service"
-SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
-SOURCE_SCRIPT_PATH="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/$SCRIPT_NAME"
-SOURCE_LIB_PATH="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/$LIB_SCRIPT_NAME"
-DEST_SCRIPT_PATH="$CONFIG_DIR/$SCRIPT_NAME"
-DEST_LIB_PATH="$CONFIG_DIR/$LIB_SCRIPT_NAME"
 
-# Source the library for shared functions
-# Override LOG_FILE for installer - use a location that won't conflict with uninstall
-LOG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/gmm-install.log"
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE"
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
+SOURCE_BIN="$SOURCE_DIR/gmm"
+RAW_REPO_URL="https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main"
 
-source "$SOURCE_LIB_PATH"
+# Output helpers
+info()  { printf "\033[32m[INFO]\033[0m %s\n" "$*"; }
+warn()  { printf "\033[33m[WARN]\033[0m %s\n" "$*"; }
+error() { printf "\033[31m[ERROR]\033[0m %s\n" "$*" >&2; }
 
-# --- Functions ---
+# Guard against running as root
+if [[ "$(id -u)" -eq 0 ]]; then
+    error "Do not run install.sh as root or with sudo. GMM runs as a user service."
+    exit 1
+fi
+
 check_dependencies() {
-    local deps=(systemctl bash mkdir cp chmod flock sed grep gdbus gio realpath timeout)
-    local missing=()
-    
-    for cmd in "${deps[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing+=("$cmd")
+    info "Checking system requirements..."
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        error "Python 3 is required but not installed."
+        exit 1
+    fi
+
+    local py_ok
+    py_ok=$(python3 -c "import sys; print('yes' if sys.version_info >= (3, 11) else 'no')")
+    if [[ "$py_ok" != "yes" ]]; then
+        error "Python 3.11 or newer is required."
+        exit 1
+    fi
+
+    if ! python3 -c "import gi; gi.require_version('Gio', '2.0'); from gi.repository import Gio" >/dev/null 2>&1; then
+        error "PyGObject (python3-gi) is required but missing."
+        echo "Install it via your distribution's package manager:"
+        echo "  Debian/Ubuntu: sudo apt install python3-gi"
+        echo "  Fedora:        sudo dnf install python3-gobject"
+        echo "  Arch Linux:    sudo pacman -S python-gobject"
+        exit 1
+    fi
+
+    info "Prerequisite dependencies satisfied."
+}
+
+install_binary() {
+    info "Installing gmm executable to $BIN_DIR/gmm..."
+    mkdir -p "$BIN_DIR"
+
+    if [[ -n "$SOURCE_DIR" ]] && [[ -f "$SOURCE_BIN" ]]; then
+        cp "$SOURCE_BIN" "$BIN_DIR/gmm"
+    else
+        info "Fetching gmm from GitHub..."
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$RAW_REPO_URL/gmm" -o "$BIN_DIR/gmm"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$BIN_DIR/gmm" "$RAW_REPO_URL/gmm"
+        else
+            error "Neither curl nor wget found. Cannot download gmm."
+            exit 1
         fi
-    done
-    
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        for cmd in "${missing[@]}"; do
-            log "ERROR" "Required command not found: $cmd (needed for installation)"
-        done
-        log "ERROR" "Please install the missing dependencies and try again."
-        exit 1
-    else
-        log "INFO" "All dependencies are installed."
+    fi
+
+    chmod +x "$BIN_DIR/gmm"
+
+    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+        warn "$BIN_DIR is not currently in your PATH."
+        warn "You may want to add 'export PATH=\"\$HOME/.local/bin:\$PATH\"' to your ~/.bashrc or ~/.zshrc."
     fi
 }
 
-create_config_dir() {
-    if [[ ! -d "$CONFIG_DIR" ]]; then
-        mkdir -p "$CONFIG_DIR"
-        log "INFO" "Created directory: $CONFIG_DIR"
-    else
-        log "INFO" "Configuration directory already exists: $CONFIG_DIR"
-    fi
-}
+install_config() {
+    mkdir -p "$CONFIG_DIR"
+    local target_config="$CONFIG_DIR/config.toml"
 
-create_default_config() {
-    create_config_dir  # ensure the directory exists
-    
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-    cat >"$CONFIG_FILE" <<'EOF'
-POLL_INTERVAL=3
-MOUNT_STRUCTURE_DIR="$HOME"
-LOG_LEVEL="INFO"
-MAX_LOG_SIZE=1024
-LOG_ROTATE_COUNT=5
-ENABLE_BOOKMARKS=true
+    if [[ ! -f "$target_config" ]]; then
+        info "Creating default configuration at $target_config..."
+        cat > "$target_config" <<'EOF'
+# GMM (GSConnect / KDE Connect Mount Manager) Configuration File
 
-# --- Android Storage Paths ---
-# These paths are the ONLY storage locations that will be detected and symlinked.
-# Add common internal, external, and USB storage paths here.
-# Paths are comma-separated
-INTERNAL_STORAGE_PATHS="/storage/emulated/0"
-EXTERNAL_STORAGE_PATHS=""
-USB_STORAGE_PATHS=""
+[general]
+# Base directory where device symlinks are organized
+mount_structure_dir = "~/Devices"
+
+# GTK bookmark mode: "both", "sftp_only", "local_only", "none"
+bookmark_mode = "both"
+
+# Show desktop notifications when storage is connected or disconnected
+notifications = true
+
+# Automatically trigger SFTP mounting when a paired device connects to Wi-Fi
+auto_mount = true
+
+# Clean up empty device directories and dangling links on disconnect
+auto_cleanup = true
+
+[storage]
+# Automatically discover Internal and SD Card UUID partitions
+auto_discover = true
+
+# Exclude internal Android pseudo-directories from symlinking
+exclude_directories = ["self", "knox", "legacy", "sdcard"]
+
+# Custom storage paths (optional override). Format: ["/mount/path:DisplayName"]
+custom_paths = []
+
+[logging]
+level = "INFO"
 EOF
-        log "INFO" "Default configuration created at $CONFIG_FILE"
     else
-        log "WARN" "Configuration file already exists. Skipping creation."
+        info "Configuration file already exists at $target_config. Preserving existing config."
     fi
-}
-
-copy_script() {
-    log "INFO" "Copying script files..."
-    
-    # --- Copy Main Script ---
-    if [[ ! -f "$SOURCE_SCRIPT_PATH" ]]; then
-        log "ERROR" "Source script not found at $SOURCE_SCRIPT_PATH"
-        exit 1
-    fi
-    cp "$SOURCE_SCRIPT_PATH" "$DEST_SCRIPT_PATH" || {
-        log "ERROR" "Failed to copy script to $DEST_SCRIPT_PATH"
-        exit 1
-    }
-    chmod +x "$DEST_SCRIPT_PATH" || {
-        log "ERROR" "Failed to make script executable"
-        exit 1
-    }
-    log "INFO" "Main script copied to $DEST_SCRIPT_PATH"
-
-    # --- Copy Library Script ---
-    if [[ ! -f "$SOURCE_LIB_PATH" ]]; then
-        log "ERROR" "Library script not found at $SOURCE_LIB_PATH"
-        exit 1
-    fi
-    cp "$SOURCE_LIB_PATH" "$DEST_LIB_PATH" || {
-        log "ERROR" "Failed to copy library to $DEST_LIB_PATH"
-        exit 1
-    }
-    log "INFO" "Library script copied to $DEST_LIB_PATH"
 }
 
 install_systemd_service() {
-    log "INFO" "Installing systemd user service..."
-
-    # Stop the service if it's already running to ensure a clean update
-    if systemctl --user is-active --quiet "$SERVICE_NAME"; then
-        log "INFO" "Service is running. Stopping it for update..."
-        systemctl --user stop "$SERVICE_NAME" || log "WARN" "Failed to stop the service. Continuing anyway."
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return
     fi
 
-    mkdir -p "$(dirname "$SERVICE_FILE")"
-    cat > "$SERVICE_FILE" <<EOF
+    info "Installing systemd user service..."
+    mkdir -p "$SYSTEMD_USER_DIR"
+    cat > "$SYSTEMD_USER_DIR/$SERVICE_NAME" <<EOF
 [Unit]
-Description=GMM (GSConnect Mount Manager)
-After=network-online.target
+Description=GMM (GSConnect / KDE Connect Mount Manager)
+Documentation=https://github.com/vjaykrsna/gsconnect-mount-manager
+After=network.target
 
 [Service]
 Type=simple
-ExecStart=$DEST_SCRIPT_PATH
+ExecStart=%h/.local/bin/gmm daemon
 Restart=on-failure
-RestartSec=10
-StartLimitInterval=60
+RestartSec=5
+StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Install]
 WantedBy=default.target
 EOF
 
-    log "INFO" "Reloading systemd user daemon..."
-    systemctl --user daemon-reload || {
-        log "ERROR" "Failed to reload systemd user daemon"
-        exit 1
-    }
-
-    systemctl --user enable --now "$SERVICE_NAME" || {
-        log "ERROR" "Failed to enable/start service"
-        exit 1
-    }
-
-    log "INFO" "Systemd service installed and started successfully"
+    systemctl --user daemon-reload
+    systemctl --user enable --now "$SERVICE_NAME"
+    info "Systemd user service enabled and started."
 }
 
-# --- Main Installation Logic ---
 main() {
-    # Add separator to log file
-    printf -- '-%.0s' {1..50} >> "$LOG_FILE"
-    printf "\n" >> "$LOG_FILE"
-    log "INFO" "Starting GMM (GSConnect Mount Manager) installation..."
+    echo "================================================="
+    echo "  GMM (GSConnect / KDE Connect Mount Manager) 2.0"
+    echo "================================================="
 
     check_dependencies
-    create_default_config
-    copy_script
+    install_binary
+    install_config
     install_systemd_service
 
-    log "INFO" "-------------------------------------------------"
-    log "INFO" "Installation complete!"
-    log "INFO" "To edit settings, modify: $CONFIG_FILE"
-    log "INFO" "-------------------------------------------------"
+    echo "-------------------------------------------------"
+    info "Installation complete!"
+    echo
+    echo "Useful commands:"
+    echo "  gmm status                  - View connected devices, mounts, and bookmarks"
+    echo "  gmm list                    - List paired devices"
+    echo "  gmm doctor                  - Run diagnostic checks"
+    echo "  systemctl --user status gmm - Check background service status"
+    echo "-------------------------------------------------"
 }
 
-# Run the installer
 main
