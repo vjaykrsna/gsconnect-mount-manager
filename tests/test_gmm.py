@@ -153,6 +153,40 @@ class TestStorageScanner(unittest.TestCase):
         partitions = self.scanner.discover(self.mount_root)
         self.assertNotIn("self", partitions)
 
+    def test_saf_root_fallback(self):
+        # When Android SAF mounts directly expose folders like DCIM / Download at root
+        (self.mount_root / "DCIM").mkdir()
+        (self.mount_root / "Download").mkdir()
+
+        partitions = self.scanner.discover(self.mount_root)
+        self.assertIn("Internal", partitions)
+        self.assertEqual(partitions["Internal"], self.mount_root)
+
+    def test_custom_paths_traversal_prevention(self):
+        cfg = gmm.Config(custom_paths=["../../etc:System"])
+        scanner = gmm.StorageScanner(cfg)
+        partitions = scanner.discover(self.mount_root)
+        self.assertNotIn("System", partitions)
+
+    def test_saf_subdirectory_discovery(self):
+        internal_sub = self.mount_root / "Internal storage"
+        sd_sub = self.mount_root / "SD card"
+        internal_sub.mkdir()
+        sd_sub.mkdir()
+
+        partitions = self.scanner.discover(self.mount_root)
+        self.assertIn("Internal", partitions)
+        self.assertEqual(partitions["Internal"], internal_sub)
+        self.assertIn("SDCard", partitions)
+        self.assertEqual(partitions["SDCard"], sd_sub)
+
+    def test_generic_storage_fallback(self):
+        # A custom exposed directory with files (e.g. Music share)
+        (self.mount_root / "song.mp3").write_text("audio")
+        partitions = self.scanner.discover(self.mount_root)
+        self.assertIn("Storage", partitions)
+        self.assertEqual(partitions["Storage"], self.mount_root)
+
 
 class TestBookmarkManager(unittest.TestCase):
     """Test GTK bookmark modifications and file safety."""
@@ -197,6 +231,75 @@ class TestBookmarkManager(unittest.TestCase):
         self.assertIn("Downloads Downloads", content_after)
         self.assertNotIn("Pixel_7", content_after)
 
+    def test_clean_bookmarks_with_url_encoding(self):
+        devices_dir = Path(self.temp_dir) / "Devices"
+        devices_dir.mkdir(parents=True)
+        valid_phone = devices_dir / "My Phone"
+        valid_phone.mkdir(parents=True)
+
+        # Write bookmarks: one valid with spaces, one dead with spaces, one outside devices
+        dead_uri = (devices_dir / "Dead Phone").as_uri()
+        valid_uri = valid_phone.as_uri()
+        outside_uri = "file:///home/user/Documents Documents"
+
+        self.bm_file.write_text(
+            f"{outside_uri}\n{dead_uri} Dead Phone\n{valid_uri} My Phone\n",
+            encoding="utf-8",
+        )
+
+        removed = self.manager.clean_bookmarks(devices_dir)
+        self.assertEqual(removed, 1)
+
+        content = self.bm_file.read_text(encoding="utf-8")
+        self.assertIn(outside_uri, content)
+        self.assertIn("My Phone", content)
+        self.assertNotIn("Dead Phone", content)
+
+    def test_saf_root_bookmark_uri_generation(self):
+        mount_root = Path(self.temp_dir) / "gvfs_mount"
+        mount_root.mkdir(parents=True, exist_ok=True)
+        partitions = {"Internal": mount_root}
+        local_dir = Path("/home/user/Devices/Pixel_7")
+
+        success = self.manager.update_device_bookmarks(
+            sanitized_name="Pixel_7",
+            partitions=partitions,
+            sftp_base_uri="sftp://192.168.1.50:1739/",
+            local_device_dir=local_dir,
+            bookmark_mode="sftp_only",
+            mount_path=mount_root,
+        )
+        self.assertTrue(success)
+        content = self.bm_file.read_text(encoding="utf-8")
+        self.assertIn("sftp://192.168.1.50:1739 Pixel_7/Internal", content)
+        self.assertNotIn("storage/gvfs_mount", content)
+
+    def test_clean_bookmarks_prefix_protection(self):
+        devices_dir = Path(self.temp_dir) / "Devices"
+        devices_dir.mkdir(parents=True, exist_ok=True)
+
+        # Sibling directory starting with the same prefix
+        archive_uri = "file:///tmp/Devices_Archive Devices_Archive"
+        dead_device_uri = (devices_dir / "Dead_Phone").as_uri() + " Dead_Phone"
+
+        self.bm_file.write_text(f"{archive_uri}\n{dead_device_uri}\n", encoding="utf-8")
+        removed = self.manager.clean_bookmarks(devices_dir)
+        self.assertEqual(removed, 1)
+
+        content = self.bm_file.read_text(encoding="utf-8")
+        self.assertIn(archive_uri, content)
+        self.assertNotIn("Dead_Phone", content)
+
+    def test_device_bookmark_label_exact_match(self):
+        user_bookmark = "file:///home/user/Work My Pixel_7"
+        device_bookmark = "file:///home/user/Devices/Pixel_7 Pixel_7"
+        self.bm_file.write_text(f"{user_bookmark}\n{device_bookmark}\n", encoding="utf-8")
+
+        self.manager.remove_device_bookmarks("Pixel_7")
+        content = self.bm_file.read_text(encoding="utf-8")
+        self.assertIn(user_bookmark, content)
+        self.assertNotIn(device_bookmark, content)
+
 
 class TestDeviceController(unittest.TestCase):
     """Test symlink creation and cleanup."""
@@ -238,6 +341,146 @@ class TestDeviceController(unittest.TestCase):
         self.assertEqual(removed, active)
         self.assertFalse(symlink.exists())
         self.assertFalse(device_dir.exists())
+        # Stray base directory is also cleaned up when empty
+        self.assertFalse(self.base_dir.exists())
+
+
+class TestCLICommands(unittest.TestCase):
+    """Test CLI commands and diagnostic reporting."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config = gmm.Config(
+            mount_structure_dir=Path(self.temp_dir) / "Devices",
+            bookmark_file=Path(self.temp_dir) / "bookmarks",
+        )
+        self.cli = gmm.CLI(self.config)
+        # Mock D-Bus so unit tests never touch real devices or system mounts
+        self.cli.dbus.get_all_devices = lambda: []
+        self.cli.dbus.is_available = lambda: True
+        self.cli._mount_device = lambda dev: True
+        self.cli._unmount_device = lambda dev: None
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_doctor_export_mode(self):
+        import io
+        from contextlib import redirect_stdout
+
+        f = io.StringIO()
+        with redirect_stdout(f):
+            ret = self.cli.cmd_doctor(export=True)
+
+        self.assertEqual(ret, 0)
+        output = f.getvalue()
+        self.assertIn("GMM System Diagnostics", output)
+        self.assertIn("Python Version", output)
+        self.assertIn("```text", output)
+
+    def test_clean_command(self):
+        ret = self.cli.cmd_clean()
+        self.assertEqual(ret, 0)
+
+    def test_mount_unmount_no_args(self):
+        ret_mount = self.cli.cmd_mount()
+        self.assertEqual(ret_mount, 0)
+        ret_unmount = self.cli.cmd_unmount()
+        self.assertEqual(ret_unmount, 0)
+
+    def test_device_matching_by_sanitized_name(self):
+        sample_dev = gmm.DeviceInfo(
+            id="dev123",
+            name="My Pixel 7",
+            is_reachable=True,
+            is_mounted=False,
+            backend="kdeconnect",
+        )
+        self.cli.dbus.get_all_devices = lambda: [sample_dev]
+
+        # Exact match
+        self.assertEqual(self.cli.dbus.find_device_by_name_or_id("My Pixel 7"), sample_dev)
+        # Case insensitive
+        self.assertEqual(self.cli.dbus.find_device_by_name_or_id("my pixel 7"), sample_dev)
+        # Sanitized name with underscores
+        self.assertEqual(self.cli.dbus.find_device_by_name_or_id("My_Pixel_7"), sample_dev)
+        # By ID
+        self.assertEqual(self.cli.dbus.find_device_by_name_or_id("dev123"), sample_dev)
+        # Nonexistent
+        self.assertIsNone(self.cli.dbus.find_device_by_name_or_id("iPhone"))
+
+    def test_device_matching_empty_query(self):
+        sample_dev = gmm.DeviceInfo(
+            id="dev123",
+            name="My Pixel 7",
+            is_reachable=True,
+            is_mounted=False,
+            backend="kdeconnect",
+        )
+        self.cli.dbus.get_all_devices = lambda: [sample_dev]
+
+        # Empty or whitespace query should NOT match the first device
+        self.assertIsNone(self.cli.dbus.find_device_by_name_or_id(""))
+        self.assertIsNone(self.cli.dbus.find_device_by_name_or_id("   "))
+
+    def test_config_command(self):
+        import io
+        from contextlib import redirect_stdout
+
+        f = io.StringIO()
+        with redirect_stdout(f):
+            ret = self.cli.cmd_config()
+        self.assertEqual(ret, 0)
+        out = f.getvalue()
+        self.assertIn("GMM Configuration", out)
+        self.assertIn("mount_structure_dir", out)
+
+        # Show path
+        f_path = io.StringIO()
+        with redirect_stdout(f_path):
+            ret_path = self.cli.cmd_config(show_path=True)
+        self.assertEqual(ret_path, 0)
+        self.assertIn("config.toml", f_path.getvalue())
+
+    def test_unmount_offline_device_directory_cleanup(self):
+        # Create a managed device directory
+        dev_dir = self.config.mount_structure_dir / "Pixel_7"
+        dev_dir.mkdir(parents=True, exist_ok=True)
+        dummy_link = dev_dir / "Internal"
+        dummy_link.symlink_to(self.temp_dir)
+
+        # Device is not on D-Bus
+        self.cli.dbus.get_all_devices = lambda: []
+
+        ret = self.cli.cmd_unmount("Pixel 7")
+        self.assertEqual(ret, 0)
+        self.assertFalse(dummy_link.exists())
+        self.assertFalse(dev_dir.exists())
+
+    def test_status_with_custom_mount_structure_dir(self):
+        custom_base = Path(self.temp_dir) / "PhoneStorage"
+        custom_base.mkdir(parents=True, exist_ok=True)
+        cfg = gmm.Config(
+            mount_structure_dir=custom_base,
+            bookmark_file=Path(self.temp_dir) / "bookmarks",
+        )
+        cli = gmm.CLI(cfg)
+
+        # Write bookmark matching custom base directory
+        cfg.bookmark_file.write_text(
+            f"file://{custom_base}/Pixel_7 Pixel_7\n", encoding="utf-8"
+        )
+
+        import io
+        from contextlib import redirect_stdout
+
+        f = io.StringIO()
+        with redirect_stdout(f):
+            ret = cli.cmd_status()
+        self.assertEqual(ret, 0)
+        out = f.getvalue()
+        self.assertIn("file://", out)
+        self.assertIn("Pixel_7", out)
 
 
 if __name__ == "__main__":

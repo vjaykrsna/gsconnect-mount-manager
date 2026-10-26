@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -124,14 +125,14 @@ class Config:
     log_level: str = "INFO"
     config_path: Path = field(
         default_factory=lambda: Path(
-            os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+            os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
         )
         / "gmm"
         / "config.toml"
     )
     bookmark_file: Path = field(
         default_factory=lambda: Path(
-            os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+            os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
         )
         / "gtk-3.0"
         / "bookmarks"
@@ -312,14 +313,17 @@ class DBusHelper:
             device_ids = res.unpack()[0]
             for dev_id in device_ids:
                 name = self._get_kde_device_name(dev_id) or dev_id
-                is_mounted = self._is_kde_device_mounted(dev_id)
+                is_reachable = self._is_kde_device_reachable(dev_id)
+                is_mounted = self._is_kde_device_mounted(dev_id) if is_reachable else False
+                host = self._get_kde_device_host(dev_id)
                 devices.append(
                     DeviceInfo(
                         id=dev_id,
                         name=name,
                         backend="kdeconnect",
-                        is_reachable=True,
+                        is_reachable=is_reachable,
                         is_mounted=is_mounted,
+                        host=host,
                     )
                 )
         except Exception as e:
@@ -343,6 +347,44 @@ class DBusHelper:
                 None,
             )
             return str(res.unpack()[0])
+        except Exception:
+            return None
+
+    def _is_kde_device_reachable(self, dev_id: str) -> bool:
+        if not self.bus:
+            return False
+        try:
+            res = self.bus.call_sync(
+                "org.kde.kdeconnect",
+                f"/modules/kdeconnect/devices/{dev_id}",
+                "org.freedesktop.DBus.Properties",
+                "Get",
+                GLib.Variant("(ss)", ("org.kde.kdeconnect.device", "isReachable")),
+                GLib.VariantType("(v)"),
+                Gio.DBusCallFlags.NONE,
+                2000,
+                None,
+            )
+            return bool(res.unpack()[0])
+        except Exception:
+            return False
+
+    def _get_kde_device_host(self, dev_id: str) -> Optional[str]:
+        if not self.bus:
+            return None
+        try:
+            res = self.bus.call_sync(
+                "org.kde.kdeconnect",
+                f"/modules/kdeconnect/devices/{dev_id}",
+                "org.freedesktop.DBus.Properties",
+                "Get",
+                GLib.Variant("(ss)", ("org.kde.kdeconnect.device", "tcpHost")),
+                GLib.VariantType("(v)"),
+                Gio.DBusCallFlags.NONE,
+                2000,
+                None,
+            )
+            return str(res.unpack()[0]) or None
         except Exception:
             return None
 
@@ -428,6 +470,17 @@ class DBusHelper:
         if not self.bus:
             return devices
 
+        active_sftp_targets = []
+        if HAS_GI and Gio:
+            try:
+                for m in Gio.VolumeMonitor.get().get_mounts():
+                    root = m.get_root()
+                    if root and root.get_uri_scheme() == "sftp":
+                        active_sftp_targets.append(root.get_uri().lower())
+                        active_sftp_targets.append(m.get_name().lower())
+            except Exception:
+                pass
+
         try:
             res = self.bus.call_sync(
                 "org.gnome.Shell.Extensions.GSConnect",
@@ -445,9 +498,18 @@ class DBusHelper:
                 if "/Device/" in path and "org.gnome.Shell.Extensions.GSConnect.Device" in interfaces:
                     props = interfaces["org.gnome.Shell.Extensions.GSConnect.Device"]
                     dev_id = path.split("/Device/")[-1]
-                    name = str(props.get("Name", dev_id))
-                    is_paired = bool(props.get("Paired", False))
-                    is_connected = bool(props.get("Connected", False))
+                    name = str(props.get("Name") or props.get("name") or dev_id)
+                    is_paired = bool(props.get("Paired", props.get("paired", False)))
+                    is_connected = bool(props.get("Connected", props.get("connected", False)))
+                    tcp_host = str(props.get("TcpHost") or props.get("tcpHost") or "") or None
+
+                    is_mounted = False
+                    if is_connected:
+                        for target in active_sftp_targets:
+                            if (tcp_host and tcp_host.lower() in target) or (name.lower() in target):
+                                is_mounted = True
+                                break
+
                     if is_paired:
                         devices.append(
                             DeviceInfo(
@@ -455,6 +517,8 @@ class DBusHelper:
                                 name=name,
                                 backend="gsconnect",
                                 is_reachable=is_connected,
+                                is_mounted=is_mounted,
+                                host=tcp_host,
                             )
                         )
         except Exception as e:
@@ -484,19 +548,67 @@ class DBusHelper:
             logging.error(f"Failed to mount GSConnect device {dev_id}: {e}")
             return False
 
+    def unmount_gsconnect_device(self, dev_id: str) -> bool:
+        """Trigger SFTP unmount action on GSConnect device."""
+        if not self.bus:
+            return False
+        try:
+            logging.info(f"Triggering unmount for GSConnect device: {dev_id}")
+            self.bus.call_sync(
+                "org.gnome.Shell.Extensions.GSConnect",
+                f"/org/gnome/Shell/Extensions/GSConnect/Device/{dev_id}",
+                "org.gtk.Actions",
+                "Activate",
+                GLib.Variant("(sava{sv})", ("unmount", [], {})),
+                None,
+                Gio.DBusCallFlags.NONE,
+                5000,
+                None,
+            )
+            return True
+        except Exception as e:
+            logging.debug(f"Failed to unmount GSConnect device {dev_id}: {e}")
+            return False
+
+    def unmount_gio_sftp(self, host_or_ip: str) -> bool:
+        """Unmount any active GVfs SFTP mount matching host or IP."""
+        if not HAS_GI or not Gio or not host_or_ip:
+            return False
+        unmounted = False
+        try:
+            for m in Gio.VolumeMonitor.get().get_mounts():
+                root = m.get_root()
+                if root and root.get_uri_scheme() == "sftp":
+                    if host_or_ip in root.get_uri() or host_or_ip in m.get_name():
+                        m.unmount_with_operation(Gio.MountUnmountFlags.NONE, None, None, None)
+                        unmounted = True
+        except Exception as e:
+            logging.debug(f"GIO unmount failed: {e}")
+        return unmounted
+
     def get_all_devices(self) -> List[DeviceInfo]:
         """Return combined list of devices across available backends."""
         return self.get_kdeconnect_devices() + self.get_gsconnect_devices()
 
     def find_device_by_name_or_id(self, query: str) -> Optional[DeviceInfo]:
-        """Match a device by name or ID (case-insensitive substring allowed)."""
+        """Match a device by raw name, sanitized name, or ID."""
+        if not query or not query.strip():
+            return None
         devices = self.get_all_devices()
-        q_lower = query.lower()
+        q_lower = query.lower().strip()
         for dev in devices:
-            if dev.id.lower() == q_lower or dev.name.lower() == q_lower:
+            if (
+                dev.id.lower() == q_lower
+                or dev.name.lower() == q_lower
+                or sanitize_device_name(dev.name).lower() == q_lower
+            ):
                 return dev
         for dev in devices:
-            if q_lower in dev.name.lower() or q_lower in dev.id.lower():
+            if (
+                q_lower in dev.name.lower()
+                or q_lower in dev.id.lower()
+                or q_lower in sanitize_device_name(dev.name).lower()
+            ):
                 return dev
         return None
 
@@ -522,11 +634,18 @@ class StorageScanner:
 
         storage_root = mount_path / "storage"
 
+        saf_indicators = ["DCIM", "Download", "Documents", "Pictures", "Android", "Music", "Movies"]
+
         # 1. Standard Android Internal Storage: /storage/emulated/0
         internal_path = storage_root / "emulated" / "0"
         if internal_path.exists() and internal_path.is_dir():
             partitions["Internal"] = internal_path
             logging.debug(f"Discovered Internal storage: {internal_path}")
+        else:
+            # Fallback for Android SAF or KDE Connect mount roots where DCIM/Download are at root
+            if any((mount_path / indicator).exists() for indicator in saf_indicators):
+                partitions["Internal"] = mount_path
+                logging.debug(f"Discovered root-mapped Internal storage (SAF): {mount_path}")
 
         # 2. Dynamic MicroSD / USB-OTG Detection via Volume UUIDs
         if self.config.auto_discover and storage_root.exists() and storage_root.is_dir():
@@ -550,15 +669,46 @@ class StorageScanner:
                             logging.debug(f"Discovered custom storage directory: {entry}")
             except (PermissionError, OSError) as e:
                 logging.warning(f"Could not fully scan {storage_root}: {e}")
+        elif self.config.auto_discover and not partitions:
+            # Android SAF trees exposed as subdirectories of mount_path (e.g. "Internal storage", "SD card")
+            try:
+                for entry in sorted(mount_path.iterdir()):
+                    if entry.is_dir() and not entry.name.startswith("."):
+                        low_name = entry.name.lower()
+                        if "internal" in low_name or "primary" in low_name:
+                            partitions["Internal"] = entry
+                            logging.debug(f"Discovered SAF Internal storage folder: {entry}")
+                        elif "sd" in low_name or "card" in low_name or "external" in low_name:
+                            partitions["SDCard"] = entry
+                            logging.debug(f"Discovered SAF SDCard folder: {entry}")
+                        elif any((entry / ind).exists() for ind in saf_indicators):
+                            partitions[entry.name] = entry
+                            logging.debug(f"Discovered SAF media folder: {entry}")
+            except (PermissionError, OSError) as e:
+                logging.debug(f"Could not scan mount root subdirectories: {e}")
 
-        # 3. User-defined custom paths from config
+        # 3. User-defined custom paths from config (with path traversal protection)
         for custom_entry in self.config.custom_paths:
             if ":" in custom_entry:
                 rel_path, label = custom_entry.split(":", 1)
                 full_custom_path = (mount_path / rel_path.lstrip("/")).resolve()
-                if full_custom_path.exists() and full_custom_path.is_dir():
+                if (
+                    is_safe_subpath(full_custom_path, mount_path)
+                    and full_custom_path.exists()
+                    and full_custom_path.is_dir()
+                ):
                     partitions[label.strip()] = full_custom_path
                     logging.debug(f"Added configured custom path ({label}): {full_custom_path}")
+
+        # 4. Final fallback: If nothing matched but mount_path contains readable entries
+        if not partitions:
+            try:
+                entries = [e for e in mount_path.iterdir() if not e.name.startswith(".")]
+                if entries:
+                    partitions["Storage"] = mount_path
+                    logging.debug(f"Discovered generic storage root: {mount_path}")
+            except (PermissionError, OSError):
+                pass
 
         return partitions
 
@@ -573,6 +723,22 @@ class BookmarkManager:
 
     def __init__(self, bookmark_file: Path) -> None:
         self.bookmark_file = bookmark_file
+
+    @staticmethod
+    def _is_device_bookmark(
+        line: str,
+        sanitized_name: str,
+        local_uri: Optional[str] = None,
+    ) -> bool:
+        """Check if a bookmark line belongs to the given device."""
+        parts = line.strip().split(" ", 1)
+        uri = parts[0]
+        label = parts[1] if len(parts) > 1 else ""
+        if local_uri and uri == local_uri:
+            return True
+        if label == sanitized_name or label.startswith(f"{sanitized_name}/"):
+            return True
+        return False
 
     def get_bookmarks(self) -> List[str]:
         """Read all lines from the bookmarks file."""
@@ -592,6 +758,7 @@ class BookmarkManager:
         sftp_base_uri: str,
         local_device_dir: Path,
         bookmark_mode: str,
+        mount_path: Optional[Path] = None,
     ) -> bool:
         """Atomically add or update bookmarks for a device."""
         if bookmark_mode == "none":
@@ -611,19 +778,17 @@ class BookmarkManager:
                         with open(self.bookmark_file, "r", encoding="utf-8") as f:
                             lines = [line.strip() for line in f if line.strip()]
 
+                    local_uri = local_device_dir.resolve().as_uri()
+
                     # Remove any existing bookmarks for this device
                     cleaned = [
                         line
                         for line in lines
-                        if not (
-                            line.endswith(f" {sanitized_name}")
-                            or f" {sanitized_name}/" in line
-                        )
+                        if not self._is_device_bookmark(line, sanitized_name, local_uri)
                     ]
 
                     # 1. Local directory bookmark (immune to IP address changes)
                     if bookmark_mode in ("both", "local_only"):
-                        local_uri = local_device_dir.resolve().as_uri()
                         cleaned.append(f"{local_uri} {sanitized_name}")
 
                     # 2. Direct SFTP bookmarks for partitions
@@ -631,13 +796,25 @@ class BookmarkManager:
                         clean_base = sftp_base_uri.rstrip("/")
                         for label, p_path in partitions.items():
                             # Find relative path from GVfs SFTP mount root
-                            # Example p_path: /run/user/1000/gvfs/sftp:host=1.2.3.4,port=1739/storage/emulated/0
-                            match = re.search(r"sftp:[^/]+(/(.*))$", str(p_path))
-                            if match:
-                                rel_path = match.group(1)
-                            else:
-                                rel_path = f"/storage/{p_path.name}"
-                            sftp_uri = f"{clean_base}{rel_path}"
+                            rel_path = None
+                            if mount_path:
+                                try:
+                                    rel = p_path.resolve().relative_to(mount_path.resolve())
+                                    rel_str = rel.as_posix()
+                                    rel_path = "" if rel_str == "." else f"/{rel_str}"
+                                except (ValueError, RuntimeError):
+                                    pass
+
+                            if rel_path is None:
+                                match = re.search(r"sftp:[^/]+(/(.*))$", str(p_path))
+                                if match:
+                                    rel_path = match.group(1)
+                                elif re.search(r"sftp:[^/]+/?$", str(p_path)):
+                                    rel_path = ""
+                                else:
+                                    rel_path = "/storage/emulated/0" if p_path.name == "0" else f"/storage/{p_path.name}"
+
+                            sftp_uri = f"{clean_base}{rel_path}" if rel_path else clean_base
                             cleaned.append(f"{sftp_uri} {sanitized_name}/{label}")
 
                     # Write atomically via tempfile
@@ -663,9 +840,18 @@ class BookmarkManager:
                     pass
             return False
 
-    def remove_device_bookmarks(self, sanitized_name: str) -> bool:
+    def remove_device_bookmarks(
+        self,
+        sanitized_name: str,
+        local_uri: Optional[str] = None,
+    ) -> bool:
         """Remove all bookmarks associated with a device name."""
         if not self.bookmark_file.exists():
+            return True
+
+        # Fast pre-check: if no bookmarks match this device, exit without lock churn
+        lines = self.get_bookmarks()
+        if not lines or not any(self._is_device_bookmark(l, sanitized_name, local_uri) for l in lines):
             return True
 
         lock_path = self.bookmark_file.with_suffix(".lock")
@@ -682,10 +868,7 @@ class BookmarkManager:
                     cleaned = [
                         line
                         for line in lines
-                        if not (
-                            line.endswith(f" {sanitized_name}")
-                            or f" {sanitized_name}/" in line
-                        )
+                        if not self._is_device_bookmark(line, sanitized_name, local_uri)
                     ]
 
                     if len(cleaned) == len(lines):
@@ -712,6 +895,85 @@ class BookmarkManager:
                 except OSError:
                     pass
             return False
+
+    def clean_bookmarks(self, mount_dir: Path) -> int:
+        """Atomically remove dead file:// bookmarks under mount_dir and return count of removed items."""
+        if not self.bookmark_file.exists():
+            return 0
+
+        # Fast pre-check: read without lock to avoid disk write/lock churn if nothing to clean
+        lines = self.get_bookmarks()
+        if not lines:
+            return 0
+
+        mount_dir_resolved = mount_dir.resolve()
+        has_dead = False
+        for b in lines:
+            parts = b.split(" ", 1)
+            uri = parts[0]
+            if uri.startswith("file://"):
+                decoded_path = urllib.parse.unquote(urllib.parse.urlparse(uri).path)
+                try:
+                    target_p = Path(decoded_path).resolve()
+                    if target_p != mount_dir_resolved and mount_dir_resolved in target_p.parents:
+                        if not Path(decoded_path).exists():
+                            has_dead = True
+                            break
+                except Exception:
+                    pass
+
+        if not has_dead:
+            return 0
+
+        lock_path = self.bookmark_file.with_suffix(".lock")
+        temp_path = self.bookmark_file.with_suffix(".tmp")
+        removed_count = 0
+
+        try:
+            with open(lock_path, "w", encoding="utf-8") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    lines = []
+                    with open(self.bookmark_file, "r", encoding="utf-8") as f:
+                        lines = [line.strip() for line in f if line.strip()]
+
+                    cleaned = []
+                    for b in lines:
+                        parts = b.split(" ", 1)
+                        uri = parts[0]
+                        if uri.startswith("file://"):
+                            decoded_path = urllib.parse.unquote(urllib.parse.urlparse(uri).path)
+                            try:
+                                target_p = Path(decoded_path).resolve()
+                                if target_p != mount_dir_resolved and mount_dir_resolved in target_p.parents:
+                                    if not Path(decoded_path).exists():
+                                        removed_count += 1
+                                        continue
+                            except Exception:
+                                pass
+                        cleaned.append(b)
+
+                    if removed_count > 0:
+                        with open(temp_path, "w", encoding="utf-8") as tf:
+                            for item in cleaned:
+                                tf.write(f"{item}\n")
+                            tf.flush()
+                            os.fsync(tf.fileno())
+                        os.replace(temp_path, self.bookmark_file)
+
+                    return removed_count
+
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+        except Exception as e:
+            logging.error(f"Error during atomic bookmark cleanup: {e}")
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            return 0
 
 
 # =============================================================================
@@ -758,12 +1020,26 @@ class DeviceController:
 
         device_dir.mkdir(parents=True, exist_ok=True)
 
+        # Remove any existing symlinks that are no longer part of active partitions
+        for child in list(device_dir.iterdir()):
+            if child.is_symlink() and child.name not in partitions:
+                try:
+                    child.unlink()
+                    logging.info(f"Removed obsolete partition symlink: {child}")
+                except OSError as e:
+                    logging.warning(f"Failed to remove obsolete symlink {child}: {e}")
+
         # Create or update partition symlinks
         for label, target in partitions.items():
             symlink = device_dir / label
+            target_str = str(target)
             try:
                 if symlink.is_symlink():
-                    if symlink.resolve() != target.resolve():
+                    try:
+                        current_target = os.readlink(symlink)
+                    except OSError:
+                        current_target = None
+                    if current_target != target_str:
                         symlink.unlink()
                         symlink.symlink_to(target)
                         logging.info(f"Updated symlink: {symlink} -> {target}")
@@ -776,12 +1052,9 @@ class DeviceController:
                 logging.error(f"Failed to create symlink {symlink} -> {target}: {e}")
 
         # Parse host and port from URI (sftp://host:port/)
-        host = None
-        port = None
-        match = re.search(r"sftp://([^:/]+)(?::([0-9]+))?", uri)
-        if match:
-            host = match.group(1)
-            port = int(match.group(2)) if match.group(2) else 1739
+        parsed_uri = urllib.parse.urlparse(uri)
+        host = parsed_uri.hostname
+        port = parsed_uri.port or 1739
 
         active = ActiveDevice(
             uri=uri,
@@ -799,6 +1072,9 @@ class DeviceController:
     def teardown_device(self, uri: str) -> Optional[ActiveDevice]:
         """Clean up symlinks and directories when a device disconnects."""
         active = self.active_devices.pop(uri, None)
+        if not active:
+            alt_uri = uri.rstrip("/") if uri.endswith("/") else f"{uri}/"
+            active = self.active_devices.pop(alt_uri, None)
         if not active:
             return None
 
@@ -819,6 +1095,16 @@ class DeviceController:
                     logging.info(f"Removed device directory: {active.device_dir}")
             except OSError as e:
                 logging.debug(f"Directory not empty or could not be removed: {e}")
+
+            # Remove base directory if empty and not Home directory
+            base_dir = self.config.mount_structure_dir.resolve()
+            if base_dir != Path.home().resolve() and base_dir.exists():
+                try:
+                    if not any(base_dir.iterdir()):
+                        base_dir.rmdir()
+                        logging.info(f"Removed empty base directory: {base_dir}")
+                except OSError as e:
+                    logging.debug(f"Base directory not empty or could not be removed: {e}")
 
         return active
 
@@ -893,6 +1179,12 @@ class GMMDaemon:
         logging.info(f"Base Directory: {self.config.mount_structure_dir}")
         logging.info(f"Bookmark Mode: {self.config.bookmark_mode}")
 
+        # Ensure default configuration exists
+        try:
+            self.config.save_default()
+        except OSError as e:
+            logging.debug(f"Could not write default config: {e}")
+
         self.volume_monitor = Gio.VolumeMonitor.get()
         self.volume_monitor.connect("mount-added", self._on_mount_added)
         self.volume_monitor.connect("mount-removed", self._on_mount_removed)
@@ -901,16 +1193,99 @@ class GMMDaemon:
         # Initial reconciliation: inspect already active mounts
         self._reconcile_existing_mounts()
 
+        # Auto-mount setup if enabled
+        if self.config.auto_mount:
+            self._setup_auto_mount()
+
         # Handle Unix termination signals
         self.loop = GLib.MainLoop()
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+        if HAS_GI and GLib and hasattr(GLib, "unix_signal_add"):
+            try:
+                GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self._glib_signal_handler, signal.SIGINT)
+                GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self._glib_signal_handler, signal.SIGTERM)
+            except Exception:
+                signal.signal(signal.SIGINT, self._handle_signal)
+                signal.signal(signal.SIGTERM, self._handle_signal)
+        else:
+            signal.signal(signal.SIGINT, self._handle_signal)
+            signal.signal(signal.SIGTERM, self._handle_signal)
 
         logging.info("GMM Daemon active and listening for mount events.")
         try:
             self.loop.run()
         except (KeyboardInterrupt, SystemExit):
             self.stop()
+
+    def _setup_auto_mount(self) -> None:
+        """Trigger initial auto-mount and subscribe to D-Bus device reachability signals."""
+        if not self.dbus.is_available():
+            return
+
+        logging.info("Auto-mount enabled. Checking paired devices...")
+        try:
+            for dev in self.dbus.get_all_devices():
+                if dev.is_reachable and not dev.is_mounted:
+                    logging.info(f"Auto-mounting online device: {dev.name} ({dev.backend})")
+                    if dev.backend == "kdeconnect":
+                        self.dbus.mount_kde_device(dev.id)
+                    elif dev.backend == "gsconnect":
+                        self.dbus.mount_gsconnect_device(dev.id)
+        except Exception as e:
+            logging.debug(f"Error checking devices for auto-mount: {e}")
+
+        # Subscribe to D-Bus signals for real-time connection events
+        if self.dbus.bus:
+            try:
+                # KDE Connect: reachableChanged on org.kde.kdeconnect.device
+                self.dbus.bus.signal_subscribe(
+                    "org.kde.kdeconnect",
+                    "org.kde.kdeconnect.device",
+                    "reachableChanged",
+                    None,
+                    None,
+                    Gio.DBusSignalFlags.NONE,
+                    self._on_kde_reachable_changed,
+                    None,
+                )
+            except Exception as e:
+                logging.debug(f"Could not subscribe to KDE Connect reachableChanged: {e}")
+
+            try:
+                # GSConnect: PropertiesChanged on org.freedesktop.DBus.Properties
+                self.dbus.bus.signal_subscribe(
+                    "org.gnome.Shell.Extensions.GSConnect",
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    None,
+                    None,
+                    Gio.DBusSignalFlags.NONE,
+                    self._on_gsconnect_properties_changed,
+                    None,
+                )
+            except Exception as e:
+                logging.debug(f"Could not subscribe to GSConnect PropertiesChanged: {e}")
+
+    def _on_kde_reachable_changed(self, connection, sender, object_path, interface_name, signal_name, parameters, user_data) -> None:
+        try:
+            is_reachable = parameters.unpack()[0]
+            if is_reachable:
+                dev_id = object_path.split("/")[-1]
+                logging.info(f"KDE Connect device {dev_id} joined network. Auto-mounting...")
+                self.dbus.mount_kde_device(dev_id)
+        except Exception as e:
+            logging.debug(f"Error in KDE reachableChanged signal: {e}")
+
+    def _on_gsconnect_properties_changed(self, connection, sender, object_path, interface_name, signal_name, parameters, user_data) -> None:
+        try:
+            if "/Device/" in object_path:
+                unpacked = parameters.unpack()
+                changed_props = unpacked[1]
+                if changed_props.get("Connected") is True or changed_props.get("connected") is True:
+                    dev_id = object_path.split("/Device/")[-1]
+                    logging.info(f"GSConnect device {dev_id} connected. Auto-mounting...")
+                    self.dbus.mount_gsconnect_device(dev_id)
+        except Exception as e:
+            logging.debug(f"Error in GSConnect PropertiesChanged signal: {e}")
 
     def stop(self) -> None:
         """Clean shutdown of daemon."""
@@ -921,6 +1296,11 @@ class GMMDaemon:
     def _handle_signal(self, signum: int, frame: Any) -> None:
         logging.info(f"Received termination signal ({signum}).")
         self.stop()
+
+    def _glib_signal_handler(self, signum: int) -> bool:
+        logging.info(f"Received termination signal ({signum}).")
+        self.stop()
+        return GLib.SOURCE_REMOVE if (HAS_GI and GLib) else False
 
     def _reconcile_existing_mounts(self) -> None:
         """Check for existing SFTP mounts already present when daemon launches."""
@@ -953,7 +1333,10 @@ class GMMDaemon:
                 logging.info(f"Mount removed event detected: {uri}")
                 active = self.controller.teardown_device(uri)
                 if active:
-                    self.bookmarks.remove_device_bookmarks(active.sanitized_name)
+                    self.bookmarks.remove_device_bookmarks(
+                        active.sanitized_name,
+                        local_uri=active.device_dir.resolve().as_uri(),
+                    )
                     self.notifier.notify(
                         "Storage Disconnected",
                         f"{active.name} storage has been unmounted.",
@@ -1004,6 +1387,7 @@ class GMMDaemon:
                 uri,
                 active.device_dir,
                 self.config.bookmark_mode,
+                mount_path=mount_path,
             )
             # Desktop notification
             partition_names = ", ".join(partitions.keys()) or "Storage"
@@ -1015,16 +1399,31 @@ class GMMDaemon:
             )
 
     def _resolve_display_name(self, raw_name: str, uri: str) -> str:
-        """Resolve friendly device name from D-Bus if raw mount name is generic."""
+        """Resolve friendly device name from D-Bus without multi-device misattribution."""
         # Generic names look like "sftp on 192.168.1.50:1739" or similar
         if not raw_name or "sftp on" in raw_name.lower() or raw_name.startswith("sftp:"):
-            match = re.search(r"sftp://([^:/]+)", uri)
-            host = match.group(1) if match else None
+            parsed_uri = urllib.parse.urlparse(uri)
+            host = parsed_uri.hostname
 
-            # Try to query connected devices via D-Bus
-            for dev in self.dbus.get_all_devices():
-                if dev.is_reachable and dev.name:
-                    return dev.name
+            devices = self.dbus.get_all_devices()
+            # 1. Match directly by host/IP if known
+            if host:
+                for dev in devices:
+                    if dev.host == host and dev.name:
+                        return dev.name
+
+            # 2. Match device name inside raw_name (e.g. "sftp on Pixel 7:1739")
+            if raw_name:
+                for dev in devices:
+                    if dev.name and dev.name.lower() in raw_name.lower():
+                        return dev.name
+
+            # 3. If exactly one device is reachable, safely attribute to it
+            reachable_devs = [d for d in devices if d.is_reachable and d.name]
+            if len(reachable_devs) == 1:
+                return reachable_devs[0].name
+
+            # 4. Fallback to host IP rather than misattributing to the first device
             return host or "Android_Device"
 
         return raw_name
@@ -1105,7 +1504,12 @@ class CLI:
         # Registered bookmarks
         print(colorize("Current GTK Bookmarks:", COLOR_BOLD))
         all_bm = self.bookmarks.get_bookmarks()
-        gmm_bm = [b for b in all_bm if "Devices" in b or "sftp://" in b]
+        mount_dir_str = self.config.mount_structure_dir.as_posix()
+        mount_dir_name = self.config.mount_structure_dir.name
+        gmm_bm = [
+            b for b in all_bm
+            if mount_dir_str in urllib.parse.unquote(b) or f"/{mount_dir_name}/" in b or "sftp://" in b
+        ]
         if gmm_bm:
             for b in gmm_bm:
                 print(f"  • {b}")
@@ -1137,13 +1541,7 @@ class CLI:
 
         return 0
 
-    def cmd_mount(self, device_query: str) -> int:
-        """Trigger mount for a specific device."""
-        dev = self.dbus.find_device_by_name_or_id(device_query)
-        if not dev:
-            print(colorize(f"Error: Device '{device_query}' not found.", COLOR_RED))
-            return 1
-
+    def _mount_device(self, dev: DeviceInfo) -> bool:
         print(f"Mounting {dev.name} ({dev.backend})...")
         if dev.backend == "kdeconnect":
             success = self.dbus.mount_kde_device(dev.id)
@@ -1154,35 +1552,141 @@ class CLI:
 
         if success:
             print(colorize(f"Successfully triggered mount for {dev.name}.", COLOR_GREEN))
-            return 0
+            return True
         else:
             print(colorize(f"Failed to mount {dev.name}.", COLOR_RED))
-            return 1
+            return False
 
-    def cmd_unmount(self, device_query: str) -> int:
-        """Unmount a specific device and clean up."""
+    def cmd_mount(self, device_query: Optional[str] = None) -> int:
+        """Trigger mount for a specific device, or all online devices if no argument passed."""
+        if not device_query:
+            devices = [d for d in self.dbus.get_all_devices() if d.is_reachable]
+            if not devices:
+                print("No online paired devices found to mount.")
+                return 0
+
+            print(colorize(f"Mounting all online devices ({len(devices)} found)...", COLOR_BOLD))
+            all_ok = True
+            for dev in devices:
+                if not self._mount_device(dev):
+                    all_ok = False
+            return 0 if all_ok else 1
+
         dev = self.dbus.find_device_by_name_or_id(device_query)
         if not dev:
             print(colorize(f"Error: Device '{device_query}' not found.", COLOR_RED))
             return 1
 
+        return 0 if self._mount_device(dev) else 1
+
+    def _unmount_device(self, dev: DeviceInfo) -> None:
         print(f"Unmounting {dev.name} ({dev.backend})...")
         if dev.backend == "kdeconnect":
             self.dbus.unmount_kde_device(dev.id)
+        elif dev.backend == "gsconnect":
+            self.dbus.unmount_gsconnect_device(dev.id)
+
+        # Unmount matching GVfs SFTP mount if still present
+        if dev.host:
+            self.dbus.unmount_gio_sftp(dev.host)
+        if dev.name:
+            self.dbus.unmount_gio_sftp(dev.name)
 
         # Trigger cleanup
         sanitized = sanitize_device_name(dev.name)
-        self.bookmarks.remove_device_bookmarks(sanitized)
-        dev_dir = self.config.mount_structure_dir / sanitized
-        if dev_dir.exists():
-            shutil.rmtree(dev_dir, ignore_errors=True)
-            print(f"Removed local directory {dev_dir}")
+        dev_dir = (self.config.mount_structure_dir / sanitized).resolve()
+        self.bookmarks.remove_device_bookmarks(sanitized, local_uri=dev_dir.as_uri())
+        if is_safe_subpath(dev_dir, self.config.mount_structure_dir) and dev_dir.exists():
+            # Safely unlink symlinks
+            for item in list(dev_dir.iterdir()):
+                if item.is_symlink():
+                    try:
+                        item.unlink()
+                    except OSError:
+                        pass
+            # Remove directory if empty
+            try:
+                if not any(dev_dir.iterdir()):
+                    dev_dir.rmdir()
+                    print(f"Removed local directory {dev_dir}")
+                else:
+                    print(f"Preserved user files in {dev_dir}")
+            except OSError:
+                pass
 
         print(colorize(f"Cleaned up {dev.name}.", COLOR_GREEN))
+
+    def cmd_unmount(self, device_query: Optional[str] = None) -> int:
+        """Unmount a specific device, or all devices if no argument passed."""
+        if not device_query:
+            devices = [d for d in self.dbus.get_all_devices() if d.is_mounted or d.is_reachable]
+            if devices:
+                print(colorize(f"Unmounting all devices ({len(devices)} found)...", COLOR_BOLD))
+                for dev in devices:
+                    self._unmount_device(dev)
+            else:
+                print("No mounted devices detected via D-Bus.")
+
+            # Unmount any remaining active GVfs SFTP storage mounts
+            if HAS_GI and Gio:
+                try:
+                    for m in Gio.VolumeMonitor.get().get_mounts():
+                        root = m.get_root()
+                        if root and root.get_uri_scheme() == "sftp":
+                            try:
+                                m.unmount_with_operation(Gio.MountUnmountFlags.NONE, None, None, None)
+                                print(f"Unmounted SFTP storage: {m.get_name()}")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            # Full sweep cleanup
+            self.cmd_clean()
+            return 0
+
+        dev = self.dbus.find_device_by_name_or_id(device_query)
+        if not dev:
+            # Fallback: check if managed device folder exists locally
+            sanitized = sanitize_device_name(device_query)
+            dev_dir = (self.config.mount_structure_dir / sanitized).resolve()
+            if is_safe_subpath(dev_dir, self.config.mount_structure_dir) and dev_dir.exists():
+                print(colorize(f"Device '{device_query}' not active on D-Bus, cleaning local directory...", COLOR_YELLOW))
+                for item in list(dev_dir.iterdir()):
+                    if item.is_symlink():
+                        try:
+                            item.unlink()
+                        except OSError:
+                            pass
+                try:
+                    if not any(dev_dir.iterdir()):
+                        dev_dir.rmdir()
+                        print(f"Removed local directory {dev_dir}")
+                except OSError:
+                    pass
+                self.bookmarks.remove_device_bookmarks(sanitized, local_uri=dev_dir.as_uri())
+                print(colorize(f"Cleaned up {sanitized}.", COLOR_GREEN))
+                return 0
+
+            print(colorize(f"Error: Device '{device_query}' not found.", COLOR_RED))
+            return 1
+
+        self._unmount_device(dev)
+
+        # Remove base directory if empty and not Home
+        base_dir = self.config.mount_structure_dir.resolve()
+        if base_dir != Path.home().resolve() and base_dir.exists():
+            try:
+                if not any(base_dir.iterdir()):
+                    base_dir.rmdir()
+                    logging.info(f"Removed empty base directory: {base_dir}")
+            except OSError:
+                pass
+
         return 0
 
     def cmd_clean(self) -> int:
-        """Clean up stale symlinks, empty device folders, and dangling bookmarks."""
+        """Clean up stale symlinks, empty device folders, dangling bookmarks, and empty base folder."""
         print(colorize("Cleaning up GMM artifacts...", COLOR_BOLD))
         removed_links = 0
         removed_dirs = 0
@@ -1212,79 +1716,207 @@ class CLI:
                     except OSError:
                         pass
 
-        # Clean bookmarks
-        bookmarks = self.bookmarks.get_bookmarks()
-        cleaned_bookmarks = []
-        for b in bookmarks:
-            parts = b.split(" ", 1)
-            uri = parts[0]
-            if uri.startswith("file://"):
-                path_str = uri.replace("file://", "")
-                if self.config.mount_structure_dir.as_posix() in path_str:
-                    if not Path(path_str).exists():
-                        continue
-            cleaned_bookmarks.append(b)
+            # Remove base directory if completely empty and not Home
+            base_dir = self.config.mount_structure_dir.resolve()
+            if base_dir != Path.home().resolve() and base_dir.exists():
+                try:
+                    if not any(base_dir.iterdir()):
+                        base_dir.rmdir()
+                        logging.info(f"Removed empty base directory: {base_dir}")
+                except OSError:
+                    pass
 
-        if len(cleaned_bookmarks) != len(bookmarks):
-            try:
-                temp_p = self.config.bookmark_file.with_suffix(".tmp")
-                with open(temp_p, "w", encoding="utf-8") as f:
-                    for line in cleaned_bookmarks:
-                        f.write(f"{line}\n")
-                os.replace(temp_p, self.config.bookmark_file)
-            except Exception as e:
-                logging.warning(f"Could not rewrite bookmarks file: {e}")
+        # Clean bookmarks atomically with flock and URL decoding
+        removed_bmarks = self.bookmarks.clean_bookmarks(self.config.mount_structure_dir)
 
-        print(colorize(f"Clean complete. Removed {removed_links} dead symlinks, {removed_dirs} empty folders.", COLOR_GREEN))
+        print(colorize(f"Clean complete. Removed {removed_links} dead symlinks, {removed_dirs} empty folders, {removed_bmarks} dead bookmarks.", COLOR_GREEN))
         return 0
 
-    def cmd_doctor(self) -> int:
-        """Run system diagnostics for GMM prerequisites."""
-        print(colorize("GMM System Diagnostics (Doctor)", COLOR_BOLD))
-        print("─" * 50)
+    def cmd_doctor(self, export: bool = False) -> int:
+        """Run system diagnostics for GMM prerequisites and output actionable tips."""
+        lines = []
+
+        def out(text: str, raw: str = ""):
+            if export:
+                lines.append(raw or re.sub(r"\033\[[0-9;]*m", "", text))
+            else:
+                print(text)
+
+        out(colorize("GMM System Diagnostics (Doctor)", COLOR_BOLD), "# GMM System Diagnostics")
+        out("─" * 50, "```text")
 
         # 1. Python & PyGObject
         py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-        print(f"Python Version     : {py_ver} " + colorize("✓", COLOR_GREEN))
+        out(f"Python Version     : {py_ver} " + colorize("✓", COLOR_GREEN), f"Python Version     : {py_ver} [OK]")
 
         if HAS_GI and Gio and GLib:
-            print("PyGObject (gi)     : Available " + colorize("✓", COLOR_GREEN))
+            out("PyGObject (gi)     : Available " + colorize("✓", COLOR_GREEN), "PyGObject (gi)     : Available [OK]")
         else:
-            print("PyGObject (gi)     : " + colorize("MISSING (Install python3-gi)", COLOR_RED))
+            out("PyGObject (gi)     : " + colorize("MISSING (Install python3-gi)", COLOR_RED), "PyGObject (gi)     : MISSING")
 
         if tomllib:
-            print("TOML Parser        : Available " + colorize("✓", COLOR_GREEN))
+            out("TOML Parser        : Available " + colorize("✓", COLOR_GREEN), "TOML Parser        : Available [OK]")
         else:
-            print("TOML Parser        : " + colorize("MISSING (Python 3.11+ required)", COLOR_RED))
+            out("TOML Parser        : " + colorize("MISSING (Python 3.11+ required)", COLOR_RED), "TOML Parser        : MISSING")
 
         # 2. D-Bus Session
         if self.dbus.is_available():
-            print("D-Bus Session Bus  : Connected " + colorize("✓", COLOR_GREEN))
+            out("D-Bus Session Bus  : Connected " + colorize("✓", COLOR_GREEN), "D-Bus Session Bus  : Connected [OK]")
         else:
-            print("D-Bus Session Bus  : " + colorize("UNAVAILABLE", COLOR_RED))
+            out("D-Bus Session Bus  : " + colorize("UNAVAILABLE", COLOR_RED), "D-Bus Session Bus  : UNAVAILABLE")
 
         # 3. Backends
         backends = self.dbus.detect_backends()
         if backends:
-            print(f"Detected Backends  : {', '.join(backends)} " + colorize("✓", COLOR_GREEN))
+            out(f"Detected Backends  : {', '.join(backends)} " + colorize("✓", COLOR_GREEN), f"Detected Backends  : {', '.join(backends)} [OK]")
         else:
-            print("Detected Backends  : " + colorize("None active (Start GSConnect or KDE Connect)", COLOR_YELLOW))
+            out("Detected Backends  : " + colorize("None active", COLOR_YELLOW), "Detected Backends  : None active")
 
         # 4. Systemd
         has_systemctl = shutil.which("systemctl") is not None
         if has_systemctl:
-            print("systemd            : Available " + colorize("✓", COLOR_GREEN))
+            out("systemd            : Available " + colorize("✓", COLOR_GREEN), "systemd            : Available [OK]")
         else:
-            print("systemd            : " + colorize("MISSING", COLOR_YELLOW))
+            out("systemd            : " + colorize("MISSING", COLOR_YELLOW), "systemd            : MISSING")
 
         # 5. GTK Bookmarks
         bm_exists = self.config.bookmark_file.exists()
         if bm_exists:
-            print(f"GTK Bookmarks File : {self.config.bookmark_file} " + colorize("✓", COLOR_GREEN))
+            out(f"GTK Bookmarks File : {self.config.bookmark_file} " + colorize("✓", COLOR_GREEN), f"GTK Bookmarks File : {self.config.bookmark_file} [OK]")
         else:
-            print(f"GTK Bookmarks File : {self.config.bookmark_file} " + colorize("(Will be created)", COLOR_YELLOW))
+            out(f"GTK Bookmarks File : {self.config.bookmark_file} " + colorize("(Will be created)", COLOR_YELLOW), f"GTK Bookmarks File : {self.config.bookmark_file} [Pending]")
+
+        out("─" * 50, "```")
+
+        # Actionable Tips & Suggestions
+        tips = []
+        if not backends:
+            tips.append("• No mobile backend detected. Ensure GSConnect (GNOME Extension) or KDE Connect is installed and running.")
+            tips.append("• GSConnect and KDE Connect require local firewall ports 1716-1764 (TCP/UDP) open.")
+        else:
+            devices = self.dbus.get_all_devices()
+            if not devices:
+                tips.append("• Backend is active, but no paired devices were found. Pair your phone via GSConnect or KDE Connect settings.")
+            else:
+                unmounted = [d for d in devices if not d.is_mounted and d.is_reachable]
+                if unmounted:
+                    dev_names = ", ".join(d.name for d in unmounted)
+                    tips.append(f"• Device(s) connected but storage unmounted: {dev_names}")
+                    tips.append("  💡 Open KDE Connect on phone -> Plugin Settings -> enable 'Filesystem access' / Storage permissions.")
+
+        if tips:
+            if export:
+                out("\n### Actionable Tips\n")
+                for tip in tips:
+                    out(tip)
+            else:
+                print(colorize("\nTroubleshooting Tips:", COLOR_BOLD))
+                for tip in tips:
+                    print(colorize(tip, COLOR_YELLOW))
+
+        if export:
+            print("\n".join(lines))
+            print("\n*(Diagnostic report ready for copying into GitHub bug reports)*")
 
         return 0
+
+    def cmd_config(self, show_path: bool = False, init: bool = False) -> int:
+        """Inspect or initialize GMM configuration."""
+        if show_path:
+            print(self.config.config_path)
+            return 0
+
+        if init:
+            if self.config.config_path.exists():
+                print(colorize(f"Config file already exists at {self.config.config_path}", COLOR_YELLOW))
+            else:
+                self.config.save_default()
+                print(colorize(f"Created default configuration at {self.config.config_path}", COLOR_GREEN))
+            return 0
+
+        print(colorize(f"GMM Configuration ({self.config.config_path}):", COLOR_BOLD))
+        print("─" * 50)
+        print(f"mount_structure_dir = {self.config.mount_structure_dir}")
+        print(f"bookmark_mode       = {self.config.bookmark_mode}")
+        print(f"notifications       = {self.config.notifications}")
+        print(f"auto_mount          = {self.config.auto_mount}")
+        print(f"auto_cleanup        = {self.config.auto_cleanup}")
+        print(f"auto_discover       = {self.config.auto_discover}")
+        print(f"exclude_directories = {self.config.exclude_directories}")
+        print(f"custom_paths        = {self.config.custom_paths}")
+        print(f"logging.level       = {self.config.log_level}")
+        print(f"bookmarks_file      = {self.config.bookmark_file}")
+        return 0
+
+    def cmd_update(self) -> int:
+        """Self-update GMM to the latest version from GitHub main branch."""
+        import py_compile
+        import urllib.request
+
+        raw_url = "https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main/gmm"
+        print(colorize("Checking for GMM updates from GitHub...", COLOR_BOLD))
+
+        # Target installation path
+        bin_dir = Path(os.environ.get("XDG_BIN_HOME") or (Path.home() / ".local" / "bin"))
+        bin_path = bin_dir / "gmm"
+        if not bin_path.exists():
+            resolved_self = Path(sys.argv[0]).resolve()
+            if resolved_self.name == "gmm" and not (resolved_self.parent / ".git").exists():
+                bin_path = resolved_self
+            else:
+                bin_path.parent.mkdir(parents=True, exist_ok=True)
+
+        temp_file = bin_path.with_suffix(".tmp_update")
+
+        try:
+            req = urllib.request.Request(raw_url, headers={"User-Agent": f"GMM-Updater/{__version__}"})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                content = response.read()
+
+            with open(temp_file, "wb") as f:
+                f.write(content)
+
+            # Validate python syntax of downloaded file
+            try:
+                py_compile.compile(str(temp_file), doraise=True)
+            except Exception as compile_err:
+                logging.error(f"Downloaded update failed syntax validation: {compile_err}")
+                if temp_file.exists():
+                    temp_file.unlink()
+                return 1
+
+            # Replace binary atomically
+            os.replace(temp_file, bin_path)
+            bin_path.chmod(0o755)
+
+            # Restart user service if running
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", "restart", "gmm.service"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+
+            print(colorize("✓ GMM successfully updated to the latest version!", COLOR_GREEN))
+            # Print new version info
+            try:
+                res = subprocess.run([str(bin_path), "--version"], capture_output=True, text=True)
+                print(colorize(f"Installed: {res.stdout.strip()}", COLOR_CYAN))
+            except Exception:
+                pass
+
+            return 0
+
+        except Exception as e:
+            logging.error(f"Failed to update GMM: {e}")
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
+            return 1
 
     def cmd_uninstall(self, purge: bool = False, confirm: bool = False) -> int:
         """Uninstall GMM, stop service, and clean up artifacts."""
@@ -1309,7 +1941,8 @@ class CLI:
             pass
 
         # 3. Remove systemd user service file
-        service_file = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user" / service_name
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+        service_file = config_home / "systemd" / "user" / service_name
         if service_file.exists():
             try:
                 service_file.unlink()
@@ -1325,8 +1958,9 @@ class CLI:
                 shutil.rmtree(config_dir, ignore_errors=True)
                 print(f"Purged configuration directory: {config_dir}")
 
-        # 5. Remove executable binary if installed in ~/.local/bin/gmm
-        bin_path = Path.home() / ".local" / "bin" / "gmm"
+        # 5. Remove executable binary if installed in ~/.local/bin/gmm or XDG_BIN_HOME
+        bin_dir = Path(os.environ.get("XDG_BIN_HOME") or (Path.home() / ".local" / "bin"))
+        bin_path = bin_dir / "gmm"
         if bin_path.exists():
             try:
                 bin_path.unlink()
@@ -1370,23 +2004,32 @@ def main() -> int:
     subparsers.add_parser("list", help="List paired GSConnect / KDE Connect devices")
 
     # mount
-    mount_parser = subparsers.add_parser("mount", help="Mount a device by name or ID")
-    mount_parser.add_argument("device", help="Device name or device ID")
+    mount_parser = subparsers.add_parser("mount", help="Mount a device (or all devices if omitted)")
+    mount_parser.add_argument("device", nargs="?", default=None, help="Device name or ID (omit to mount all)")
 
     # unmount
-    unmount_parser = subparsers.add_parser("unmount", help="Unmount a device by name or ID")
-    unmount_parser.add_argument("device", help="Device name or device ID")
+    unmount_parser = subparsers.add_parser("unmount", help="Unmount a device (or all devices if omitted)")
+    unmount_parser.add_argument("device", nargs="?", default=None, help="Device name or ID (omit to unmount all)")
 
     # clean
     subparsers.add_parser("clean", help="Clean up stale symlinks, empty folders, and dead bookmarks")
 
+    # config
+    config_parser = subparsers.add_parser("config", help="Inspect or initialize configuration")
+    config_parser.add_argument("--path", action="store_true", help="Print path to config.toml")
+    config_parser.add_argument("--init", action="store_true", help="Initialize default config.toml if missing")
+
     # doctor
-    subparsers.add_parser("doctor", help="Run diagnostic checks on system and dependencies")
+    doctor_parser = subparsers.add_parser("doctor", help="Run diagnostic checks on system and dependencies")
+    doctor_parser.add_argument("--export", action="store_true", help="Export diagnostic report as Markdown for bug reporting")
+
+    # update
+    subparsers.add_parser("update", help="Update GMM to the latest version from GitHub")
 
     # uninstall
     uninstall_parser = subparsers.add_parser("uninstall", help="Uninstall GMM, stop service, and clean up artifacts")
     uninstall_parser.add_argument("--purge", action="store_true", help="Also purge configuration directory")
-    uninstall_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    uninstall_parser.add_argument("-y", "--yes", "--force", action="store_true", help="Skip confirmation prompt")
 
     args = parser.parse_args()
 
@@ -1423,9 +2066,15 @@ def main() -> int:
     elif args.command == "clean":
         cli = CLI(config)
         return cli.cmd_clean()
+    elif args.command == "config":
+        cli = CLI(config)
+        return cli.cmd_config(show_path=args.path, init=args.init)
     elif args.command == "doctor":
         cli = CLI(config)
-        return cli.cmd_doctor()
+        return cli.cmd_doctor(export=args.export)
+    elif args.command == "update":
+        cli = CLI(config)
+        return cli.cmd_update()
     elif args.command == "uninstall":
         cli = CLI(config)
         return cli.cmd_uninstall(purge=args.purge, confirm=args.yes)

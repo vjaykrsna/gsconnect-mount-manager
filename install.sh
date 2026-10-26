@@ -74,7 +74,25 @@ install_binary() {
 
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
         warn "$BIN_DIR is not currently in your PATH."
-        warn "You may want to add 'export PATH=\"\$HOME/.local/bin:\$PATH\"' to your ~/.bashrc or ~/.zshrc."
+        if [[ -t 0 ]]; then
+            read -p "Would you like to automatically add $BIN_DIR to your shell configuration? (y/N) " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                local shell_rc="$HOME/.bashrc"
+                if [[ "${SHELL:-}" == *"zsh"* ]] && [[ -f "$HOME/.zshrc" ]]; then
+                    shell_rc="$HOME/.zshrc"
+                fi
+                {
+                    echo ""
+                    echo "# Added by GMM installer"
+                    echo "export PATH=\"$BIN_DIR:\$PATH\""
+                } >> "$shell_rc"
+                info "Added PATH export to $shell_rc."
+                info "Run 'source $shell_rc' or restart your terminal to use 'gmm'."
+            fi
+        else
+            warn "Add 'export PATH=\"$BIN_DIR:\$PATH\"' to your ~/.bashrc or ~/.zshrc to use 'gmm' directly."
+        fi
     fi
 }
 
@@ -132,11 +150,11 @@ install_systemd_service() {
 [Unit]
 Description=GMM (GSConnect / KDE Connect Mount Manager)
 Documentation=https://github.com/vjaykrsna/gsconnect-mount-manager
-After=network.target
+After=dbus.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/gmm daemon
+ExecStart=$BIN_DIR/gmm daemon
 Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=60
@@ -146,9 +164,18 @@ StartLimitBurst=3
 WantedBy=default.target
 EOF
 
-    systemctl --user daemon-reload
-    systemctl --user enable --now "$SERVICE_NAME"
-    info "Systemd user service enabled and started."
+    if ! systemctl --user daemon-reload 2>/dev/null; then
+        warn "Could not reload systemd user daemon (systemd user session may not be active)."
+        warn "You can manually enable the service later with: systemctl --user enable --now $SERVICE_NAME"
+        return
+    fi
+
+    if systemctl --user enable --now "$SERVICE_NAME" 2>/dev/null; then
+        info "Systemd user service enabled and started."
+    else
+        warn "Could not start systemd user service automatically."
+        warn "Start it manually when logged into a systemd session: systemctl --user start $SERVICE_NAME"
+    fi
 }
 
 main() {
