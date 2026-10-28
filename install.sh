@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# GMM (GSConnect / KDE Connect Mount Manager) 2.0 Installer
+# GMM (GSConnect / KDE Connect Mount Manager) 2.0.1 Installer
 # -----------------------------------------------------------------------------
 
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
@@ -56,21 +56,30 @@ install_binary() {
     info "Installing gmm executable to $BIN_DIR/gmm..."
     mkdir -p "$BIN_DIR"
 
+    local temp_bin
+    temp_bin="$(mktemp "$BIN_DIR/.gmm-install.XXXXXX")"
     if [[ -n "$SOURCE_DIR" ]] && [[ -f "$SOURCE_BIN" ]]; then
-        cp "$SOURCE_BIN" "$BIN_DIR/gmm"
+        cp "$SOURCE_BIN" "$temp_bin"
     else
         info "Fetching gmm from GitHub..."
         if command -v curl >/dev/null 2>&1; then
-            curl -fsSL "$RAW_REPO_URL/gmm" -o "$BIN_DIR/gmm"
+            curl -fsSL "$RAW_REPO_URL/gmm" -o "$temp_bin" || { rm -f "$temp_bin"; return 1; }
         elif command -v wget >/dev/null 2>&1; then
-            wget -qO "$BIN_DIR/gmm" "$RAW_REPO_URL/gmm"
+            wget -qO "$temp_bin" "$RAW_REPO_URL/gmm" || { rm -f "$temp_bin"; return 1; }
         else
+            rm -f "$temp_bin"
             error "Neither curl nor wget found. Cannot download gmm."
-            exit 1
+            return 1
         fi
     fi
 
-    chmod +x "$BIN_DIR/gmm"
+    if ! python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' "$temp_bin"; then
+        rm -f "$temp_bin"
+        error "The downloaded executable failed Python syntax validation."
+        return 1
+    fi
+    chmod +x "$temp_bin"
+    mv -f "$temp_bin" "$BIN_DIR/gmm"
 
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
         warn "$BIN_DIR is not currently in your PATH."
@@ -170,8 +179,20 @@ EOF
         return
     fi
 
+    local was_active=false
+    if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        was_active=true
+    fi
     if systemctl --user enable --now "$SERVICE_NAME" 2>/dev/null; then
-        info "Systemd user service enabled and started."
+        if [[ "$was_active" == true ]]; then
+            if systemctl --user restart "$SERVICE_NAME" 2>/dev/null; then
+                info "Systemd user service restarted with the updated executable."
+            else
+                warn "The service could not be restarted; run: systemctl --user restart $SERVICE_NAME"
+            fi
+        else
+            info "Systemd user service enabled and started."
+        fi
     else
         warn "Could not start systemd user service automatically."
         warn "Start it manually when logged into a systemd session: systemctl --user start $SERVICE_NAME"
@@ -180,7 +201,7 @@ EOF
 
 main() {
     echo "================================================="
-    echo "  GMM (GSConnect / KDE Connect Mount Manager) 2.0"
+    echo "  GMM (GSConnect / KDE Connect Mount Manager) 2.0.1"
     echo "================================================="
 
     check_dependencies

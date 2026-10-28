@@ -1,38 +1,44 @@
 ---
 name: Bug report
-about: Create a report to help us improve
-title: ''
+about: Report a problem with GMM
 labels: ''
 assignees: ''
-
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+**What happened, and what did you expect?**
+<!-- Include the exact error message, if any. -->
 
-**System & Diagnostic Output**
-Please run the following commands and paste the output:
+**How can we reproduce it?**
+1. First, ...
+2. Then, ...
+3. Finally, ...
+
+**System and diagnostics**
+
+Run the commands below in a terminal just after reproducing the problem. Paste the output in the section below, including any errors.
+
+<details>
+<summary>Commands to collect diagnostics</summary>
 
 ```bash
-# Diagnostic checks
+gmm --version
+cat /etc/os-release
+echo "Desktop: ${XDG_CURRENT_DESKTOP:-unknown}"
 gmm doctor
-
-# Current daemon & mount status
 gmm status
-
-# Recent service logs (last 30 lines)
-journalctl --user -u gmm -n 30 --no-pager
+journalctl --user -u gmm -n 50 --no-pager
 ```
+</details>
 
-**Steps to Reproduce**
-1. Connect device '...'
-2. Trigger mount via '...'
-3. See error
+Before posting, review the output for **usernames, device names and IDs, IP addresses, file paths, and other private information**. Replace sensitive values consistently (for example, use `PHONE_IP` everywhere the same IP appears). Do not share passwords or keys. The output is not automatically sanitized.
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+<details>
+<summary>Paste reviewed command output here</summary>
 
-**Additional context**
-- Linux Distribution & Desktop Environment (e.g. Ubuntu 26.04 GNOME, Arch KDE Plasma)
-- Mobile Integration backend: GSConnect or KDE Connect
-- Any custom configuration in `~/.config/gmm/config.toml`
+```text
+Paste output here
+```
+</details>
+
+**Anything else that helps?**
+<!-- Include your phone model and Android version, GSConnect or KDE Connect, relevant non-default GMM settings, and a screenshot if useful. Do not share secrets or your entire config unless needed. -->

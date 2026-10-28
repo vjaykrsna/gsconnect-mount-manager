@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comprehensive unit tests for GMM 2.0."""
+"""Comprehensive unit tests for GMM."""
 
 import os
 import shutil
@@ -248,12 +248,12 @@ class TestBookmarkManager(unittest.TestCase):
         )
 
         removed = self.manager.clean_bookmarks(devices_dir)
-        self.assertEqual(removed, 1)
+        self.assertEqual(removed, 0)
 
         content = self.bm_file.read_text(encoding="utf-8")
         self.assertIn(outside_uri, content)
         self.assertIn("My Phone", content)
-        self.assertNotIn("Dead Phone", content)
+        self.assertIn("Dead Phone", content)
 
     def test_saf_root_bookmark_uri_generation(self):
         mount_root = Path(self.temp_dir) / "gvfs_mount"
@@ -284,11 +284,11 @@ class TestBookmarkManager(unittest.TestCase):
 
         self.bm_file.write_text(f"{archive_uri}\n{dead_device_uri}\n", encoding="utf-8")
         removed = self.manager.clean_bookmarks(devices_dir)
-        self.assertEqual(removed, 1)
+        self.assertEqual(removed, 0)
 
         content = self.bm_file.read_text(encoding="utf-8")
         self.assertIn(archive_uri, content)
-        self.assertNotIn("Dead_Phone", content)
+        self.assertIn("Dead_Phone", content)
 
     def test_device_bookmark_label_exact_match(self):
         user_bookmark = "file:///home/user/Work My Pixel_7"
@@ -298,7 +298,7 @@ class TestBookmarkManager(unittest.TestCase):
         self.manager.remove_device_bookmarks("Pixel_7")
         content = self.bm_file.read_text(encoding="utf-8")
         self.assertIn(user_bookmark, content)
-        self.assertNotIn(device_bookmark, content)
+        self.assertIn(device_bookmark, content)
 
 
 class TestDeviceController(unittest.TestCase):
@@ -454,8 +454,8 @@ class TestCLICommands(unittest.TestCase):
 
         ret = self.cli.cmd_unmount("Pixel 7")
         self.assertEqual(ret, 0)
-        self.assertFalse(dummy_link.exists())
-        self.assertFalse(dev_dir.exists())
+        self.assertTrue(dummy_link.is_symlink())
+        self.assertTrue(dev_dir.exists())
 
     def test_status_with_custom_mount_structure_dir(self):
         custom_base = Path(self.temp_dir) / "PhoneStorage"
@@ -482,6 +482,160 @@ class TestCLICommands(unittest.TestCase):
         self.assertIn("file://", out)
         self.assertIn("Pixel_7", out)
 
+
+
+class TestOwnershipSafety(unittest.TestCase):
+    def test_same_name_devices_have_distinct_stable_paths(self):
+        first = gmm.DeviceInfo(id="one", name="Pixel 7", backend="gsconnect")
+        second = gmm.DeviceInfo(id="two", name="Pixel_7", backend="gsconnect")
+        self.assertNotEqual(gmm.managed_device_name(first), gmm.managed_device_name(second))
+        self.assertEqual(gmm.managed_device_name(first), gmm.managed_device_name(first))
+
+    def test_setup_and_teardown_preserve_unowned_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "Devices"
+            device_dir = base / "Phone"
+            device_dir.mkdir(parents=True)
+            target = Path(tmp) / "storage"
+            target.mkdir()
+            user_link = device_dir / "UserLink"
+            user_link.symlink_to(target)
+            controller = gmm.DeviceController(gmm.Config(mount_structure_dir=base))
+            controller.setup_device("sftp://phone/", "Phone", target, {"Internal": target})
+            controller.teardown_device("sftp://phone/")
+            self.assertTrue(user_link.is_symlink())
+            self.assertFalse((device_dir / "Internal").is_symlink())
+
+    def test_clean_does_not_follow_symlinked_device_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "Devices"
+            outside = root / "outside"
+            base.mkdir()
+            outside.mkdir()
+            broken = outside / "broken"
+            broken.symlink_to(root / "missing")
+            (base / "Phone").symlink_to(outside, target_is_directory=True)
+            cli = gmm.CLI(gmm.Config(mount_structure_dir=base, bookmark_file=root / "bookmarks"))
+            cli.cmd_clean()
+            self.assertTrue(broken.is_symlink())
+
+    def test_bookmark_removal_preserves_same_label_user_bookmark(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bookmarks = root / "bookmarks"
+            user_entry = "file:///somewhere/else Phone"
+            bookmarks.write_text(user_entry + "\n")
+            manager = gmm.BookmarkManager(bookmarks)
+            local = root / "Devices" / "Phone"
+            manager.update_device_bookmarks("Phone", {}, "sftp://host", local, "local_only")
+            manager.remove_device_bookmarks("Phone", local.as_uri())
+            self.assertEqual(bookmarks.read_text().splitlines(), [user_entry])
+
+    def test_daemon_ignores_unmatched_or_ambiguous_mounts(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks")
+            daemon = gmm.GMMDaemon(cfg)
+            mount = Mock()
+            mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.1/"
+            mount.get_default_location.return_value.get_path.return_value = str(root)
+            daemon.controller.setup_device = Mock()
+            other = gmm.DeviceInfo(id="one", name="Phone", backend="gsconnect", host="192.0.2.10")
+            daemon.dbus.get_all_devices = lambda: [other]
+            daemon._process_mount(mount)
+            daemon.controller.setup_device.assert_not_called()
+            other.host = "192.0.2.1"
+            second = gmm.DeviceInfo(id="two", name="Phone 2", backend="gsconnect", host=other.host)
+            daemon.dbus.get_all_devices = lambda: [other, second]
+            daemon._process_mount(mount)
+            daemon.controller.setup_device.assert_not_called()
+
+    def test_daemon_processes_unique_matching_host(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks")
+            daemon = gmm.GMMDaemon(cfg)
+            mount = Mock()
+            mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.1/"
+            mount.get_default_location.return_value.get_path.return_value = str(root)
+            device = gmm.DeviceInfo(id="one", name="Phone", backend="gsconnect", host="192.0.2.1")
+            daemon.dbus.get_all_devices = lambda: [device]
+            daemon.scanner.discover = Mock(return_value={})
+            daemon.controller.setup_device = Mock(return_value=None)
+            daemon._process_mount(mount)
+            daemon.controller.setup_device.assert_called_once()
+            self.assertEqual(daemon.controller.setup_device.call_args.args[1], gmm.managed_device_name(device))
+
+    def test_failed_unmount_preserves_managed_links(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks")
+            device = gmm.DeviceInfo(id="one", name="Phone", backend="gsconnect")
+            controller = gmm.DeviceController(cfg)
+            active = controller.setup_device("sftp://host/", gmm.managed_device_name(device), root, {"Internal": root})
+            cli = gmm.CLI(cfg)
+            cli.dbus.unmount_gsconnect_device = Mock(return_value=False)
+            self.assertFalse(cli._unmount_device(device))
+            self.assertTrue((active.device_dir / "Internal").is_symlink())
+
+    def test_unmount_all_does_not_touch_unrelated_gio_mounts(self):
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = gmm.CLI(gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks"))
+            cli.dbus.get_all_devices = lambda: []
+            gio = Mock()
+            with patch.object(gmm, "Gio", gio), patch.object(gmm, "HAS_GI", True):
+                cli.cmd_unmount()
+            gio.VolumeMonitor.get.assert_not_called()
+
+    def test_purge_keeps_custom_config_parent(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            custom = root / "documents" / "custom.toml"
+            custom.parent.mkdir()
+            custom.write_text("[general]\n")
+            sibling = custom.parent / "important.txt"
+            sibling.write_text("keep")
+            cfg = gmm.Config(config_path=custom, mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks")
+            cli = gmm.CLI(cfg)
+            with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(root / "xdg"), "XDG_BIN_HOME": str(root / "bin")}):
+                with patch.object(gmm.subprocess, "run"):
+                    cli.cmd_uninstall(purge=True, confirm=True)
+            self.assertTrue(custom.exists())
+            self.assertTrue(sibling.exists())
+
+
+class TestUpdateWorkflow(unittest.TestCase):
+    def test_update_runs_downloaded_installer_and_returns_its_status(self):
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cli = gmm.CLI(gmm.Config(bookmark_file=root / "bookmarks"))
+            response = Mock()
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            response.read.return_value = b"#!/bin/bash\necho installer\n"
+            def run_installer(args, check):
+                self.assertEqual(args[0], "bash")
+                self.assertEqual(Path(args[1]).read_bytes(), response.read.return_value)
+                return Mock(returncode=7)
+            with patch("urllib.request.urlopen", return_value=response) as fetch, patch.object(gmm.subprocess, "run", side_effect=run_installer):
+                self.assertEqual(cli.cmd_update(), 7)
+            self.assertTrue(fetch.call_args.args[0].full_url.endswith("/install.sh"))
+
+    def test_update_download_failure_is_reported(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            cli = gmm.CLI(gmm.Config(bookmark_file=Path(tmp) / "bookmarks"))
+            with patch("urllib.request.urlopen", side_effect=OSError("offline")), patch.object(gmm.subprocess, "run") as run:
+                self.assertEqual(cli.cmd_update(), 1)
+                run.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,13 +23,13 @@ When opening an Android device via GSConnect or KDE Connect, file managers defau
 
 ```text
 ~/Devices/
-└── Pixel_7/
+└── Pixel_7_0123456789/
     ├── Internal -> /run/user/1000/gvfs/sftp:.../storage/emulated/0
     └── SDCard   -> /run/user/1000/gvfs/sftp:.../storage/3C82-16F4
 ```
 
 * **File Manager:** Click `Pixel_7` in the sidebar to browse storage directly.
-* **Terminal & CLI:** Access storage seamlessly via `cd ~/Devices/Pixel_7/Internal`.
+* **Terminal & CLI:** Access storage seamlessly via `cd ~/Devices/Pixel_7_0123456789/Internal`.
 
 ---
 
@@ -41,7 +41,7 @@ Run this in your terminal (no git clone required):
 curl -fsSL https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main/install.sh | bash
 ```
 
-> **Note:** Run as your regular user (do **not** use `sudo`). Installs `gmm` to `~/.local/bin/gmm` and enables the user systemd service.
+> **Note:** Run as your regular user (do **not** use `sudo`). Installs `gmm` to `~/.local/bin/gmm` and enables the user systemd service. To update later, run `gmm update`; it uses the same installer and preserves your configuration.
 
 <details>
 <summary><b>Or install via Git clone</b></summary>
@@ -62,7 +62,7 @@ chmod +x install.sh
 * **📱 Multi-Device Support** – Simultaneously tracks multiple phones and tablets without state collision.
 * **💾 Smart Storage Auto-Discovery** – Automatically discovers Internal Storage (`/storage/emulated/0`) and MicroSD/USB-OTG drives (detecting volume UUIDs like `3C82-16F4`) out of the box.
 * **🔖 IP-Immune Bookmarks** – Creates local directory bookmarks that stay working even when your phone changes Wi-Fi IP addresses.
-* **🛡️ Atomic File Safety** – Uses `flock` and atomic file swaps on GTK bookmarks to prevent corruption from concurrent file manager edits.
+* **🛡️ Safer Cleanup** – Tracks its own links and bookmark entries. Bookmark writes use atomic replacement and a lock shared by GMM processes; concurrent edits by other applications may still conflict.
 
 ---
 
@@ -78,8 +78,8 @@ gmm unmount           # Unmount all devices & clean up (or: gmm unmount "Pixel 7
 gmm clean             # Clean up stale symlinks and dead bookmarks
 gmm config            # Inspect active settings (or: gmm config --init)
 gmm doctor            # Check system health & dependencies
-gmm doctor --export   # Generate sanitized Markdown report for bug reports
-gmm update            # Self-update to latest version from GitHub
+gmm doctor --export   # Generate Markdown diagnostics (review for private data)
+gmm update            # Rerun the installer for the latest version from GitHub
 gmm uninstall         # Remove GMM and its background service
 ```
 
@@ -124,6 +124,12 @@ level = "INFO"
 ```
 
 To apply changes: `systemctl --user restart gmm`
+
+GMM manages an SFTP mount only when its host matches exactly one paired device
+reported by the backend. If the backend does not provide a host address, the
+mount is skipped. Device folder names include a stable ID suffix to avoid
+collisions. Links and bookmarks created by older versions without ownership
+records are preserved and may need to be removed manually.
 </details>
 
 ---

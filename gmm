@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GMM (GSConnect / KDE Connect Mount Manager) 2.0.
+"""GMM (GSConnect / KDE Connect Mount Manager) 2.0.1.
 
 Automatically organizes and provides seamless access to Android device storage
 via GSConnect and KDE Connect. Creates clean GTK bookmarks and local symlinks
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -46,7 +47,7 @@ except (ImportError, ValueError):
     Gio = None  # type: ignore
     GLib = None  # type: ignore
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 # ANSI Colors
 COLOR_RESET = "\033[0m"
@@ -70,7 +71,7 @@ def colorize(text: str, color: str) -> str:
 # =============================================================================
 
 DEFAULT_CONFIG_TOML = """# GMM (GSConnect Mount Manager) Configuration File
-# Version 2.0.0
+# Version 2.0.1
 
 [general]
 # Base directory where device symlinks are organized
@@ -218,6 +219,11 @@ def sanitize_device_name(name: str) -> str:
 
     # Truncate length if unreasonably long
     return sanitized[:64]
+
+
+def managed_device_name(device: "DeviceInfo") -> str:
+    suffix = hashlib.sha256(f"{device.backend}:{device.id}".encode()).hexdigest()[:10]
+    return f"{sanitize_device_name(device.name)[:53]}_{suffix}"
 
 
 def is_safe_subpath(target_path: Path, base_dir: Path) -> bool:
@@ -719,260 +725,120 @@ class StorageScanner:
 
 
 class BookmarkManager:
-    """Manages GTK3/4 bookmarks file safely with atomic writes and flock."""
+    """Update GTK bookmarks while tracking the exact entries created by GMM."""
 
     def __init__(self, bookmark_file: Path) -> None:
         self.bookmark_file = bookmark_file
-
-    @staticmethod
-    def _is_device_bookmark(
-        line: str,
-        sanitized_name: str,
-        local_uri: Optional[str] = None,
-    ) -> bool:
-        """Check if a bookmark line belongs to the given device."""
-        parts = line.strip().split(" ", 1)
-        uri = parts[0]
-        label = parts[1] if len(parts) > 1 else ""
-        if local_uri and uri == local_uri:
-            return True
-        if label == sanitized_name or label.startswith(f"{sanitized_name}/"):
-            return True
-        return False
+        self.state_file = bookmark_file.with_name("gmm-bookmarks.json")
 
     def get_bookmarks(self) -> List[str]:
-        """Read all lines from the bookmarks file."""
-        if not self.bookmark_file.exists():
-            return []
         try:
-            with open(self.bookmark_file, "r", encoding="utf-8") as f:
-                return [line.strip() for line in f if line.strip()]
-        except OSError as e:
-            logging.warning(f"Failed to read bookmarks file {self.bookmark_file}: {e}")
+            return self.bookmark_file.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
             return []
 
-    def update_device_bookmarks(
-        self,
-        sanitized_name: str,
-        partitions: Dict[str, Path],
-        sftp_base_uri: str,
-        local_device_dir: Path,
-        bookmark_mode: str,
-        mount_path: Optional[Path] = None,
-    ) -> bool:
-        """Atomically add or update bookmarks for a device."""
+    def _change(self, transform) -> int:
+        self.bookmark_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.bookmark_file.with_suffix(".lock")
+        with open(lock_path, "a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                lines = self.get_bookmarks()
+                try:
+                    state = json.loads(self.state_file.read_text(encoding="utf-8"))
+                    if not isinstance(state, dict):
+                        raise ValueError("Invalid bookmark state")
+                except FileNotFoundError:
+                    state = {}
+                new_lines, new_state, count = transform(lines, state)
+                if new_lines != lines:
+                    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.bookmark_file.parent, delete=False) as tmp:
+                        tmp_path = Path(tmp.name)
+                        try:
+                            tmp.write("".join(line + "\n" for line in new_lines))
+                            tmp.flush()
+                            os.fsync(tmp.fileno())
+                        except BaseException:
+                            tmp_path.unlink(missing_ok=True)
+                            raise
+                    os.replace(tmp_path, self.bookmark_file)
+                if new_state != state:
+                    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.state_file.parent, delete=False) as tmp:
+                        json.dump(new_state, tmp)
+                        tmp_path = Path(tmp.name)
+                    os.replace(tmp_path, self.state_file)
+                return count
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def update_device_bookmarks(self, sanitized_name: str, partitions: Dict[str, Path],
+                                sftp_base_uri: str, local_device_dir: Path,
+                                bookmark_mode: str, mount_path: Optional[Path] = None) -> bool:
         if bookmark_mode == "none":
             return True
-
-        self.bookmark_file.parent.mkdir(parents=True, exist_ok=True)
-
-        lock_path = self.bookmark_file.with_suffix(".lock")
-        temp_path = self.bookmark_file.with_suffix(".tmp")
-
+        local_uri = local_device_dir.absolute().as_uri()
+        additions = []
+        if bookmark_mode in ("both", "local_only"):
+            additions.append(f"{local_uri} {sanitized_name}")
+        if bookmark_mode in ("both", "sftp_only"):
+            for label, path in partitions.items():
+                try:
+                    relative = path.resolve().relative_to(mount_path.resolve()) if mount_path else None
+                except (ValueError, RuntimeError):
+                    continue
+                if relative is None:
+                    match = re.search(r"sftp:[^/]+(/.*)?$", str(path))
+                    rel = match.group(1) or "" if match else ("/storage/emulated/0" if path.name == "0" else f"/storage/{path.name}")
+                else:
+                    rel = "" if str(relative) == "." else "/" + urllib.parse.quote(relative.as_posix(), safe="/")
+                additions.append(f"{sftp_base_uri.rstrip('/')}{rel} {sanitized_name}/{label}")
+        def update(lines, state):
+            old = state.get(local_uri, [])
+            result = [line for line in lines if line not in old]
+            owned = [line for line in additions if line not in result]
+            result.extend(owned)
+            updated = dict(state)
+            updated[local_uri] = owned
+            return result, updated, len(owned)
         try:
-            with open(lock_path, "w", encoding="utf-8") as lock_file:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                try:
-                    lines = []
-                    if self.bookmark_file.exists():
-                        with open(self.bookmark_file, "r", encoding="utf-8") as f:
-                            lines = [line.strip() for line in f if line.strip()]
-
-                    local_uri = local_device_dir.resolve().as_uri()
-
-                    # Remove any existing bookmarks for this device
-                    cleaned = [
-                        line
-                        for line in lines
-                        if not self._is_device_bookmark(line, sanitized_name, local_uri)
-                    ]
-
-                    # 1. Local directory bookmark (immune to IP address changes)
-                    if bookmark_mode in ("both", "local_only"):
-                        cleaned.append(f"{local_uri} {sanitized_name}")
-
-                    # 2. Direct SFTP bookmarks for partitions
-                    if bookmark_mode in ("both", "sftp_only"):
-                        clean_base = sftp_base_uri.rstrip("/")
-                        for label, p_path in partitions.items():
-                            # Find relative path from GVfs SFTP mount root
-                            rel_path = None
-                            if mount_path:
-                                try:
-                                    rel = p_path.resolve().relative_to(mount_path.resolve())
-                                    rel_str = rel.as_posix()
-                                    rel_path = "" if rel_str == "." else f"/{rel_str}"
-                                except (ValueError, RuntimeError):
-                                    pass
-
-                            if rel_path is None:
-                                match = re.search(r"sftp:[^/]+(/(.*))$", str(p_path))
-                                if match:
-                                    rel_path = match.group(1)
-                                elif re.search(r"sftp:[^/]+/?$", str(p_path)):
-                                    rel_path = ""
-                                else:
-                                    rel_path = "/storage/emulated/0" if p_path.name == "0" else f"/storage/{p_path.name}"
-
-                            sftp_uri = f"{clean_base}{rel_path}" if rel_path else clean_base
-                            cleaned.append(f"{sftp_uri} {sanitized_name}/{label}")
-
-                    # Write atomically via tempfile
-                    with open(temp_path, "w", encoding="utf-8") as tf:
-                        for item in cleaned:
-                            tf.write(f"{item}\n")
-                        tf.flush()
-                        os.fsync(tf.fileno())
-
-                    os.replace(temp_path, self.bookmark_file)
-                    logging.info(f"Updated GTK bookmarks for {sanitized_name}")
-                    return True
-
-                finally:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-        except Exception as e:
-            logging.error(f"Error updating bookmark file: {e}")
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
+            self._change(update)
+            return True
+        except (OSError, ValueError, TypeError) as e:
+            logging.error("Error updating bookmarks: %s", e)
             return False
 
-    def remove_device_bookmarks(
-        self,
-        sanitized_name: str,
-        local_uri: Optional[str] = None,
-    ) -> bool:
-        """Remove all bookmarks associated with a device name."""
-        if not self.bookmark_file.exists():
-            return True
-
-        # Fast pre-check: if no bookmarks match this device, exit without lock churn
-        lines = self.get_bookmarks()
-        if not lines or not any(self._is_device_bookmark(l, sanitized_name, local_uri) for l in lines):
-            return True
-
-        lock_path = self.bookmark_file.with_suffix(".lock")
-        temp_path = self.bookmark_file.with_suffix(".tmp")
-
+    def remove_device_bookmarks(self, sanitized_name: str, local_uri: Optional[str] = None) -> bool:
+        def remove(lines, state):
+            keys = [local_uri] if local_uri else [key for key, entries in state.items()
+                if any(line.partition(" ")[2] == sanitized_name or
+                       line.partition(" ")[2].startswith(sanitized_name + "/") for line in entries)]
+            owned = {line for key in keys for line in state.get(key, [])}
+            result = [line for line in lines if line not in owned]
+            updated = {key: value for key, value in state.items() if key not in keys}
+            return result, updated, len(lines) - len(result)
         try:
-            with open(lock_path, "w", encoding="utf-8") as lock_file:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                try:
-                    lines = []
-                    with open(self.bookmark_file, "r", encoding="utf-8") as f:
-                        lines = [line.strip() for line in f if line.strip()]
-
-                    cleaned = [
-                        line
-                        for line in lines
-                        if not self._is_device_bookmark(line, sanitized_name, local_uri)
-                    ]
-
-                    if len(cleaned) == len(lines):
-                        return True  # Nothing to remove
-
-                    with open(temp_path, "w", encoding="utf-8") as tf:
-                        for item in cleaned:
-                            tf.write(f"{item}\n")
-                        tf.flush()
-                        os.fsync(tf.fileno())
-
-                    os.replace(temp_path, self.bookmark_file)
-                    logging.info(f"Removed GTK bookmarks for {sanitized_name}")
-                    return True
-
-                finally:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-        except Exception as e:
-            logging.error(f"Error removing device bookmarks for {sanitized_name}: {e}")
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
+            self._change(remove)
+            return True
+        except (OSError, ValueError, TypeError) as e:
+            logging.error("Error removing bookmarks: %s", e)
             return False
 
     def clean_bookmarks(self, mount_dir: Path) -> int:
-        """Atomically remove dead file:// bookmarks under mount_dir and return count of removed items."""
-        if not self.bookmark_file.exists():
-            return 0
-
-        # Fast pre-check: read without lock to avoid disk write/lock churn if nothing to clean
-        lines = self.get_bookmarks()
-        if not lines:
-            return 0
-
-        mount_dir_resolved = mount_dir.resolve()
-        has_dead = False
-        for b in lines:
-            parts = b.split(" ", 1)
-            uri = parts[0]
-            if uri.startswith("file://"):
-                decoded_path = urllib.parse.unquote(urllib.parse.urlparse(uri).path)
-                try:
-                    target_p = Path(decoded_path).resolve()
-                    if target_p != mount_dir_resolved and mount_dir_resolved in target_p.parents:
-                        if not Path(decoded_path).exists():
-                            has_dead = True
-                            break
-                except Exception:
-                    pass
-
-        if not has_dead:
-            return 0
-
-        lock_path = self.bookmark_file.with_suffix(".lock")
-        temp_path = self.bookmark_file.with_suffix(".tmp")
-        removed_count = 0
-
+        def clean(lines, state):
+            updated = dict(state)
+            removed = set()
+            for uri, entries in state.items():
+                parsed = urllib.parse.urlparse(uri)
+                path = Path(urllib.parse.unquote(parsed.path))
+                if parsed.scheme == "file" and is_safe_subpath(path, mount_dir) and not path.exists():
+                    removed.update(entries)
+                    del updated[uri]
+            result = [line for line in lines if line not in removed]
+            return result, updated, len(lines) - len(result)
         try:
-            with open(lock_path, "w", encoding="utf-8") as lock_file:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                try:
-                    lines = []
-                    with open(self.bookmark_file, "r", encoding="utf-8") as f:
-                        lines = [line.strip() for line in f if line.strip()]
-
-                    cleaned = []
-                    for b in lines:
-                        parts = b.split(" ", 1)
-                        uri = parts[0]
-                        if uri.startswith("file://"):
-                            decoded_path = urllib.parse.unquote(urllib.parse.urlparse(uri).path)
-                            try:
-                                target_p = Path(decoded_path).resolve()
-                                if target_p != mount_dir_resolved and mount_dir_resolved in target_p.parents:
-                                    if not Path(decoded_path).exists():
-                                        removed_count += 1
-                                        continue
-                            except Exception:
-                                pass
-                        cleaned.append(b)
-
-                    if removed_count > 0:
-                        with open(temp_path, "w", encoding="utf-8") as tf:
-                            for item in cleaned:
-                                tf.write(f"{item}\n")
-                            tf.flush()
-                            os.fsync(tf.fileno())
-                        os.replace(temp_path, self.bookmark_file)
-
-                    return removed_count
-
-                finally:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-        except Exception as e:
-            logging.error(f"Error during atomic bookmark cleanup: {e}")
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
+            return self._change(clean)
+        except (OSError, ValueError, TypeError) as e:
+            logging.error("Error cleaning bookmarks: %s", e)
             return 0
 
 
@@ -1020,36 +886,52 @@ class DeviceController:
 
         device_dir.mkdir(parents=True, exist_ok=True)
 
-        # Remove any existing symlinks that are no longer part of active partitions
-        for child in list(device_dir.iterdir()):
-            if child.is_symlink() and child.name not in partitions:
-                try:
-                    child.unlink()
-                    logging.info(f"Removed obsolete partition symlink: {child}")
-                except OSError as e:
-                    logging.warning(f"Failed to remove obsolete symlink {child}: {e}")
+        # Only links recorded in our manifest may be replaced or removed.
+        manifest = device_dir / ".gmm-links.json"
+        try:
+            if manifest.is_symlink():
+                raise ValueError("link manifest is a symlink")
+            managed = json.loads(manifest.read_text(encoding="utf-8"))
+            if not isinstance(managed, dict):
+                raise ValueError("invalid link manifest")
+        except FileNotFoundError:
+            managed = {}
+        except (OSError, ValueError) as e:
+            logging.error("Cannot read link manifest %s: %s", manifest, e)
+            return None
 
-        # Create or update partition symlinks
+        for label, old_target in list(managed.items()):
+            link = device_dir / label
+            if Path(label).name != label:
+                continue
+            if link.is_symlink() and os.readlink(link) == old_target and label not in partitions:
+                link.unlink()
+                del managed[label]
+
         for label, target in partitions.items():
-            symlink = device_dir / label
+            if not label or Path(label).name != label or label in (".", "..", manifest.name):
+                logging.warning("Ignoring invalid partition label: %r", label)
+                continue
+            link = device_dir / label
             target_str = str(target)
             try:
-                if symlink.is_symlink():
-                    try:
-                        current_target = os.readlink(symlink)
-                    except OSError:
-                        current_target = None
-                    if current_target != target_str:
-                        symlink.unlink()
-                        symlink.symlink_to(target)
-                        logging.info(f"Updated symlink: {symlink} -> {target}")
-                elif symlink.exists():
-                    logging.warning(f"Path exists and is not a symlink: {symlink}, skipping.")
+                if link.is_symlink():
+                    current = os.readlink(link)
+                    if managed.get(label) != current:
+                        logging.warning("Preserving unowned symlink: %s", link)
+                        continue
+                    if current != target_str:
+                        link.unlink()
+                        link.symlink_to(target)
+                elif link.exists():
+                    logging.warning("Preserving existing path: %s", link)
+                    continue
                 else:
-                    symlink.symlink_to(target)
-                    logging.info(f"Created symlink: {symlink} -> {target}")
+                    link.symlink_to(target)
+                managed[label] = target_str
             except OSError as e:
-                logging.error(f"Failed to create symlink {symlink} -> {target}: {e}")
+                logging.error("Failed to create symlink %s: %s", link, e)
+        manifest.write_text(json.dumps(managed), encoding="utf-8")
 
         # Parse host and port from URI (sftp://host:port/)
         parsed_uri = urllib.parse.urlparse(uri)
@@ -1069,6 +951,40 @@ class DeviceController:
         self.active_devices[uri] = active
         return active
 
+    @staticmethod
+    def cleanup_managed_links(device_dir: Path, stale_only: bool = False) -> int:
+        if device_dir.is_symlink() or not device_dir.is_dir():
+            return 0
+        manifest = device_dir / ".gmm-links.json"
+        try:
+            if manifest.is_symlink():
+                raise ValueError("link manifest is a symlink")
+            managed = json.loads(manifest.read_text(encoding="utf-8"))
+            if not isinstance(managed, dict):
+                return 0
+        except (OSError, ValueError):
+            return 0
+        removed = 0
+        remaining = dict(managed)
+        for label, target in managed.items():
+            if not isinstance(label, str) or Path(label).name != label or not isinstance(target, str):
+                continue
+            link = device_dir / label
+            try:
+                if link.is_symlink() and os.readlink(link) == target:
+                    if stale_only and link.exists():
+                        continue
+                    link.unlink()
+                    removed += 1
+                remaining.pop(label, None)
+            except OSError as e:
+                logging.warning("Could not clean %s: %s", link, e)
+        if remaining:
+            manifest.write_text(json.dumps(remaining), encoding="utf-8")
+        else:
+            manifest.unlink(missing_ok=True)
+        return removed
+
     def teardown_device(self, uri: str) -> Optional[ActiveDevice]:
         """Clean up symlinks and directories when a device disconnects."""
         active = self.active_devices.pop(uri, None)
@@ -1079,14 +995,7 @@ class DeviceController:
             return None
 
         if self.config.auto_cleanup and active.device_dir.exists():
-            # Remove managed symlinks
-            for child in list(active.device_dir.iterdir()):
-                if child.is_symlink():
-                    try:
-                        child.unlink()
-                        logging.debug(f"Removed symlink: {child}")
-                    except OSError as e:
-                        logging.warning(f"Could not remove symlink {child}: {e}")
+            self.cleanup_managed_links(active.device_dir)
 
             # Remove directory if empty
             try:
@@ -1366,9 +1275,16 @@ class GMMDaemon:
             return
         mount_path = Path(mount_path_str)
 
-        # Device display name resolution
-        raw_name = mount.get_name()
-        display_name = self._resolve_display_name(raw_name, uri)
+        # A host must uniquely identify a paired device. Never infer ownership from
+        # the number of reachable devices or a partial name match.
+        host = urllib.parse.urlparse(uri).hostname
+        devices = [d for d in self.dbus.get_all_devices()
+                   if host and d.host and d.host.casefold() == host.casefold()]
+        if len(devices) != 1:
+            logging.debug("Ignoring SFTP mount without a unique paired device: %s", uri)
+            return
+        device = devices[0]
+        display_name = managed_device_name(device)
 
         # Discover partitions
         partitions = self.scanner.discover(mount_path)
@@ -1579,31 +1495,24 @@ class CLI:
 
         return 0 if self._mount_device(dev) else 1
 
-    def _unmount_device(self, dev: DeviceInfo) -> None:
+    def _unmount_device(self, dev: DeviceInfo) -> bool:
         print(f"Unmounting {dev.name} ({dev.backend})...")
         if dev.backend == "kdeconnect":
-            self.dbus.unmount_kde_device(dev.id)
+            success = self.dbus.unmount_kde_device(dev.id)
         elif dev.backend == "gsconnect":
-            self.dbus.unmount_gsconnect_device(dev.id)
-
-        # Unmount matching GVfs SFTP mount if still present
-        if dev.host:
-            self.dbus.unmount_gio_sftp(dev.host)
-        if dev.name:
-            self.dbus.unmount_gio_sftp(dev.name)
+            success = self.dbus.unmount_gsconnect_device(dev.id)
+        else:
+            success = False
+        if not success:
+            logging.error("Failed to unmount %s; preserving its artifacts", dev.name)
+            return False
 
         # Trigger cleanup
-        sanitized = sanitize_device_name(dev.name)
-        dev_dir = (self.config.mount_structure_dir / sanitized).resolve()
+        sanitized = managed_device_name(dev)
+        dev_dir = (self.config.mount_structure_dir / sanitized).absolute()
         self.bookmarks.remove_device_bookmarks(sanitized, local_uri=dev_dir.as_uri())
         if is_safe_subpath(dev_dir, self.config.mount_structure_dir) and dev_dir.exists():
-            # Safely unlink symlinks
-            for item in list(dev_dir.iterdir()):
-                if item.is_symlink():
-                    try:
-                        item.unlink()
-                    except OSError:
-                        pass
+            DeviceController.cleanup_managed_links(dev_dir)
             # Remove directory if empty
             try:
                 if not any(dev_dir.iterdir()):
@@ -1615,6 +1524,7 @@ class CLI:
                 pass
 
         print(colorize(f"Cleaned up {dev.name}.", COLOR_GREEN))
+        return True
 
     def cmd_unmount(self, device_query: Optional[str] = None) -> int:
         """Unmount a specific device, or all devices if no argument passed."""
@@ -1622,42 +1532,26 @@ class CLI:
             devices = [d for d in self.dbus.get_all_devices() if d.is_mounted or d.is_reachable]
             if devices:
                 print(colorize(f"Unmounting all devices ({len(devices)} found)...", COLOR_BOLD))
+                all_ok = True
                 for dev in devices:
-                    self._unmount_device(dev)
+                    if not self._unmount_device(dev):
+                        all_ok = False
             else:
+                all_ok = True
                 print("No mounted devices detected via D-Bus.")
-
-            # Unmount any remaining active GVfs SFTP storage mounts
-            if HAS_GI and Gio:
-                try:
-                    for m in Gio.VolumeMonitor.get().get_mounts():
-                        root = m.get_root()
-                        if root and root.get_uri_scheme() == "sftp":
-                            try:
-                                m.unmount_with_operation(Gio.MountUnmountFlags.NONE, None, None, None)
-                                print(f"Unmounted SFTP storage: {m.get_name()}")
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
 
             # Full sweep cleanup
             self.cmd_clean()
-            return 0
+            return 0 if all_ok else 1
 
         dev = self.dbus.find_device_by_name_or_id(device_query)
         if not dev:
             # Fallback: check if managed device folder exists locally
             sanitized = sanitize_device_name(device_query)
-            dev_dir = (self.config.mount_structure_dir / sanitized).resolve()
-            if is_safe_subpath(dev_dir, self.config.mount_structure_dir) and dev_dir.exists():
+            dev_dir = (self.config.mount_structure_dir / sanitized).absolute()
+            if is_safe_subpath(dev_dir, self.config.mount_structure_dir) and dev_dir.exists() and not dev_dir.is_symlink():
                 print(colorize(f"Device '{device_query}' not active on D-Bus, cleaning local directory...", COLOR_YELLOW))
-                for item in list(dev_dir.iterdir()):
-                    if item.is_symlink():
-                        try:
-                            item.unlink()
-                        except OSError:
-                            pass
+                DeviceController.cleanup_managed_links(dev_dir)
                 try:
                     if not any(dev_dir.iterdir()):
                         dev_dir.rmdir()
@@ -1671,7 +1565,8 @@ class CLI:
             print(colorize(f"Error: Device '{device_query}' not found.", COLOR_RED))
             return 1
 
-        self._unmount_device(dev)
+        if not self._unmount_device(dev):
+            return 1
 
         # Remove base directory if empty and not Home
         base_dir = self.config.mount_structure_dir.resolve()
@@ -1694,18 +1589,8 @@ class CLI:
         # Clean dead symlinks and empty directories
         if self.config.mount_structure_dir.exists():
             for dev_dir in list(self.config.mount_structure_dir.iterdir()):
-                if dev_dir.is_dir():
-                    for link in list(dev_dir.iterdir()):
-                        if link.is_symlink():
-                            # Check if symlink target is missing or broken
-                            try:
-                                if not link.resolve().exists():
-                                    link.unlink()
-                                    removed_links += 1
-                                    logging.info(f"Removed broken symlink: {link}")
-                            except Exception:
-                                link.unlink()
-                                removed_links += 1
+                if dev_dir.is_dir() and not dev_dir.is_symlink():
+                    removed_links += DeviceController.cleanup_managed_links(dev_dir, stale_only=True)
 
                     # Remove directory if empty
                     try:
@@ -1849,73 +1734,27 @@ class CLI:
         return 0
 
     def cmd_update(self) -> int:
-        """Self-update GMM to the latest version from GitHub main branch."""
-        import py_compile
+        """Run the official installer to update the executable and user service."""
         import urllib.request
 
-        raw_url = "https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main/gmm"
-        print(colorize("Checking for GMM updates from GitHub...", COLOR_BOLD))
-
-        # Target installation path
-        bin_dir = Path(os.environ.get("XDG_BIN_HOME") or (Path.home() / ".local" / "bin"))
-        bin_path = bin_dir / "gmm"
-        if not bin_path.exists():
-            resolved_self = Path(sys.argv[0]).resolve()
-            if resolved_self.name == "gmm" and not (resolved_self.parent / ".git").exists():
-                bin_path = resolved_self
-            else:
-                bin_path.parent.mkdir(parents=True, exist_ok=True)
-
-        temp_file = bin_path.with_suffix(".tmp_update")
-
+        installer_url = "https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main/install.sh"
+        print(colorize("Updating GMM using the official installer...", COLOR_BOLD), flush=True)
         try:
-            req = urllib.request.Request(raw_url, headers={"User-Agent": f"GMM-Updater/{__version__}"})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                content = response.read()
-
-            with open(temp_file, "wb") as f:
-                f.write(content)
-
-            # Validate python syntax of downloaded file
-            try:
-                py_compile.compile(str(temp_file), doraise=True)
-            except Exception as compile_err:
-                logging.error(f"Downloaded update failed syntax validation: {compile_err}")
-                if temp_file.exists():
-                    temp_file.unlink()
-                return 1
-
-            # Replace binary atomically
-            os.replace(temp_file, bin_path)
-            bin_path.chmod(0o755)
-
-            # Restart user service if running
-            try:
-                subprocess.run(
-                    ["systemctl", "--user", "restart", "gmm.service"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception:
-                pass
-
-            print(colorize("✓ GMM successfully updated to the latest version!", COLOR_GREEN))
-            # Print new version info
-            try:
-                res = subprocess.run([str(bin_path), "--version"], capture_output=True, text=True)
-                print(colorize(f"Installed: {res.stdout.strip()}", COLOR_CYAN))
-            except Exception:
-                pass
-
+            request = urllib.request.Request(installer_url, headers={"User-Agent": f"GMM-Updater/{__version__}"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                installer = response.read()
+            # A private directory ensures the installer downloads the release executable
+            # instead of accidentally picking up a local file named gmm.
+            with tempfile.TemporaryDirectory(prefix="gmm-update-") as tmp:
+                script = Path(tmp) / "install.sh"
+                script.write_bytes(installer)
+                result = subprocess.run(["bash", str(script)], check=False)
+                if result.returncode:
+                    logging.error("GMM installer failed with exit code %s", result.returncode)
+                    return result.returncode
             return 0
-
-        except Exception as e:
-            logging.error(f"Failed to update GMM: {e}")
-            if temp_file.exists():
-                try:
-                    temp_file.unlink()
-                except OSError:
-                    pass
+        except (OSError, ValueError) as e:
+            logging.error("Failed to update GMM: %s", e)
             return 1
 
     def cmd_uninstall(self, purge: bool = False, confirm: bool = False) -> int:
@@ -1953,9 +1792,9 @@ class CLI:
 
         # 4. Remove config directory if purge requested
         if purge:
-            config_dir = self.config.config_path.parent
+            config_dir = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "gmm"
             if config_dir.exists():
-                shutil.rmtree(config_dir, ignore_errors=True)
+                shutil.rmtree(config_dir)
                 print(f"Purged configuration directory: {config_dir}")
 
         # 5. Remove executable binary if installed in ~/.local/bin/gmm or XDG_BIN_HOME
@@ -1980,7 +1819,7 @@ class CLI:
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="gmm",
-        description="GSConnect / KDE Connect Mount Manager 2.0",
+        description=f"GSConnect / KDE Connect Mount Manager {__version__}",
     )
     parser.add_argument(
         "-v", "--version", action="version", version=f"%(prog)s {__version__}"
