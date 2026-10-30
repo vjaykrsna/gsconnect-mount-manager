@@ -125,9 +125,10 @@ level = "INFO"
 
 To apply changes: `systemctl --user restart gmm`
 
-GMM manages an SFTP mount only when its host matches exactly one paired device
-reported by the backend. If the backend does not provide a host address, the
-mount is skipped. Device folder names include a stable ID suffix to avoid
+GMM manages an SFTP mount only when its host matches exactly one connected,
+paired device. For GSConnect, it can read the device's last LAN connection from
+GSConnect settings. If the address is unavailable or the match is ambiguous,
+the mount is skipped. Device folder names include a stable ID suffix to avoid
 collisions. Links and bookmarks created by older versions without ownership
 records are preserved and may need to be removed manually.
 </details>
@@ -146,7 +147,9 @@ records are preserved and may need to be removed manually.
 * **Changing the mount folder:**  
   Change `mount_structure_dir = "~/PhoneStorage"` in `~/.config/gmm/config.toml`, then restart: `systemctl --user restart gmm`.
 * **Diagnostics:**  
-  Run `gmm doctor` to check your Python, D-Bus, and desktop environment health.
+  Run `gmm --version`, `gmm doctor`, and `gmm status`. For service logs, run
+  `journalctl --user -u gmm -n 50 --no-pager`. Review the output for private
+  information before sharing it.
 </details>
 
 ---

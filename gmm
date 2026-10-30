@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GMM (GSConnect / KDE Connect Mount Manager) 2.0.1.
+"""GMM (GSConnect / KDE Connect Mount Manager) 2.0.2.
 
 Automatically organizes and provides seamless access to Android device storage
 via GSConnect and KDE Connect. Creates clean GTK bookmarks and local symlinks
@@ -47,7 +47,7 @@ except (ImportError, ValueError):
     Gio = None  # type: ignore
     GLib = None  # type: ignore
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 
 # ANSI Colors
 COLOR_RESET = "\033[0m"
@@ -71,7 +71,7 @@ def colorize(text: str, color: str) -> str:
 # =============================================================================
 
 DEFAULT_CONFIG_TOML = """# GMM (GSConnect Mount Manager) Configuration File
-# Version 2.0.1
+# Version 2.0.2
 
 [general]
 # Base directory where device symlinks are organized
@@ -470,20 +470,52 @@ class DBusHelper:
             logging.error(f"Failed to unmount KDE Connect device {dev_id}: {e}")
             return False
 
+    def _get_gsconnect_device_host(self, device_id: str) -> Optional[str]:
+        """Read GSConnect's last LAN connection for a connected device."""
+        if not HAS_GI or not Gio or not re.fullmatch(r"[A-Za-z0-9_-]+", device_id):
+            return None
+        schema_id = "org.gnome.Shell.Extensions.GSConnect.Device"
+        try:
+            source = Gio.SettingsSchemaSource.get_default()
+            schema = source.lookup(schema_id, True) if source else None
+            if not schema:
+                user_data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+                data_dirs = [user_data] + [Path(p) for p in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if p]
+                for directory in data_dirs:
+                    schemas = directory / "gnome-shell/extensions/gsconnect@andyholmes.github.io/schemas"
+                    if not (schemas / "gschemas.compiled").is_file():
+                        continue
+                    extension_source = Gio.SettingsSchemaSource.new_from_directory(str(schemas), source, False)
+                    schema = extension_source.lookup(schema_id, True)
+                    if schema:
+                        break
+            if not schema or not schema.has_key("last-connection"):
+                return None
+            settings = Gio.Settings.new_full(schema, None, f"/org/gnome/shell/extensions/gsconnect/device/{device_id}/")
+            address = settings.get_string("last-connection")
+            parsed = urllib.parse.urlsplit(address)
+            if parsed.scheme != "lan" or not parsed.hostname:
+                return None
+            return parsed.hostname
+        except Exception as e:
+            logging.debug("Cannot read GSConnect connection address for %s: %s", device_id, e)
+            return None
+
     def get_gsconnect_devices(self) -> List[DeviceInfo]:
         """Query GSConnect for paired devices."""
         devices = []
         if not self.bus:
             return devices
 
-        active_sftp_targets = []
+        active_sftp_hosts = set()
         if HAS_GI and Gio:
             try:
                 for m in Gio.VolumeMonitor.get().get_mounts():
                     root = m.get_root()
                     if root and root.get_uri_scheme() == "sftp":
-                        active_sftp_targets.append(root.get_uri().lower())
-                        active_sftp_targets.append(m.get_name().lower())
+                        host = urllib.parse.urlsplit(root.get_uri()).hostname
+                        if host:
+                            active_sftp_hosts.add(host.casefold())
             except Exception:
                 pass
 
@@ -508,13 +540,10 @@ class DBusHelper:
                     is_paired = bool(props.get("Paired", props.get("paired", False)))
                     is_connected = bool(props.get("Connected", props.get("connected", False)))
                     tcp_host = str(props.get("TcpHost") or props.get("tcpHost") or "") or None
-
-                    is_mounted = False
-                    if is_connected:
-                        for target in active_sftp_targets:
-                            if (tcp_host and tcp_host.lower() in target) or (name.lower() in target):
-                                is_mounted = True
-                                break
+                    if is_paired and is_connected and not tcp_host:
+                        settings_id = str(props.get("Id") or props.get("id") or dev_id)
+                        tcp_host = self._get_gsconnect_device_host(settings_id)
+                    is_mounted = bool(is_connected and tcp_host and tcp_host.casefold() in active_sftp_hosts)
 
                     if is_paired:
                         devices.append(
@@ -1269,19 +1298,27 @@ class GMMDaemon:
 
         location = mount.get_default_location()
         if not location:
+            logging.info("Skipping SFTP mount: no default location is available.")
             return
         mount_path_str = location.get_path()
         if not mount_path_str:
+            logging.info("Skipping SFTP mount: no local filesystem path is available.")
             return
         mount_path = Path(mount_path_str)
 
         # A host must uniquely identify a paired device. Never infer ownership from
         # the number of reachable devices or a partial name match.
         host = urllib.parse.urlparse(uri).hostname
-        devices = [d for d in self.dbus.get_all_devices()
+        connected = [d for d in self.dbus.get_all_devices() if d.is_reachable]
+        devices = [d for d in connected
                    if host and d.host and d.host.casefold() == host.casefold()]
         if len(devices) != 1:
-            logging.debug("Ignoring SFTP mount without a unique paired device: %s", uri)
+            missing_hosts = sum(not d.host for d in connected)
+            logging.info(
+                "Skipping SFTP mount: %d connected devices matched its host; "
+                "%d connected devices have no known host address.",
+                len(devices), missing_hosts,
+            )
             return
         device = devices[0]
         display_name = managed_device_name(device)
@@ -1686,8 +1723,9 @@ class CLI:
                 unmounted = [d for d in devices if not d.is_mounted and d.is_reachable]
                 if unmounted:
                     dev_names = ", ".join(d.name for d in unmounted)
-                    tips.append(f"• Device(s) connected but storage unmounted: {dev_names}")
-                    tips.append("  💡 Open KDE Connect on phone -> Plugin Settings -> enable 'Filesystem access' / Storage permissions.")
+                    tips.append(f"• Device(s) connected but not detected as mounted: {dev_names}")
+                    tips.append("  Check whether storage is mounted in GSConnect or KDE Connect and whether phone storage permissions are enabled.")
+                    tips.append("  If an SFTP mount is already present in 'gmm status', check the GMM service logs for mount matching errors.")
 
         if tips:
             if export:

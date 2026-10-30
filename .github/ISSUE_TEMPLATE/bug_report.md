@@ -25,12 +25,15 @@ gmm --version
 cat /etc/os-release
 echo "Desktop: ${XDG_CURRENT_DESKTOP:-unknown}"
 gmm doctor
+gmm list
 gmm status
-journalctl --user -u gmm -n 50 --no-pager
+gmm config
+systemctl --user status gmm.service --no-pager -l
+journalctl --user -u gmm -n 100 --no-pager
 ```
 </details>
 
-Before posting, review the output for **usernames, device names and IDs, IP addresses, file paths, and other private information**. Replace sensitive values consistently (for example, use `PHONE_IP` everywhere the same IP appears). Do not share passwords or keys. The output is not automatically sanitized.
+Before posting, review the output for **usernames, device names and IDs, IP addresses, file paths, custom settings, and other private information**. Replace sensitive values consistently (for example, use `PHONE_IP` everywhere the same IP appears). Do not share passwords or keys. The output is not automatically sanitized.
 
 <details>
 <summary>Paste reviewed command output here</summary>

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# GMM (GSConnect / KDE Connect Mount Manager) 2.0.1 Installer
+# GMM (GSConnect / KDE Connect Mount Manager) 2.0.2 Installer
 # -----------------------------------------------------------------------------
 
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
@@ -201,7 +201,7 @@ EOF
 
 main() {
     echo "================================================="
-    echo "  GMM (GSConnect / KDE Connect Mount Manager) 2.0.1"
+    echo "  GMM (GSConnect / KDE Connect Mount Manager) 2.0.2"
     echo "================================================="
 
     check_dependencies

@@ -611,6 +611,128 @@ class TestOwnershipSafety(unittest.TestCase):
             self.assertTrue(sibling.exists())
 
 
+
+class TestGSConnectHostDiscovery(unittest.TestCase):
+    def test_device_host_comes_from_last_connection_and_marks_mount(self):
+        from unittest.mock import Mock, patch
+        device_id = "a" * 32
+        properties = {"Id": device_id, "Name": "Pixel", "Paired": True, "Connected": True}
+        objects = {"/org/gnome/Shell/Extensions/GSConnect/Device/" + device_id:
+                   {"org.gnome.Shell.Extensions.GSConnect.Device": properties}}
+        bus = Mock()
+        bus.call_sync.return_value.unpack.return_value = (objects,)
+        helper = gmm.DBusHelper()
+        helper.bus = bus
+        mount = Mock()
+        mount.get_root.return_value.get_uri_scheme.return_value = "sftp"
+        mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.1:1739/"
+        with patch.object(gmm.Gio.VolumeMonitor, "get", return_value=Mock(get_mounts=Mock(return_value=[mount]))), \
+             patch.object(helper, "_get_gsconnect_device_host", return_value="192.0.2.1") as lookup:
+            devices = helper.get_gsconnect_devices()
+        lookup.assert_called_once_with(device_id)
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0].host, "192.0.2.1")
+        self.assertTrue(devices[0].is_mounted)
+
+    def test_reported_mount_creates_links_and_bookmarks(self):
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mount_path = root / "mounted"
+            internal = mount_path / "storage/emulated/0"
+            internal.mkdir(parents=True)
+            cfg = gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks", notifications=False)
+            daemon = gmm.GMMDaemon(cfg)
+            device_id = "a" * 32
+            objects = {"/org/gnome/Shell/Extensions/GSConnect/Device/" + device_id:
+                       {"org.gnome.Shell.Extensions.GSConnect.Device":
+                        {"Id": device_id, "Name": "Pixel", "Paired": True, "Connected": True}}}
+            daemon.dbus.bus = Mock()
+            daemon.dbus.bus.call_sync.return_value.unpack.return_value = (objects,)
+            daemon.dbus.get_kdeconnect_devices = lambda: []
+            mount = Mock()
+            mount.get_root.return_value.get_uri_scheme.return_value = "sftp"
+            mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.1:1739/"
+            mount.get_default_location.return_value.get_path.return_value = str(mount_path)
+            with patch.object(gmm.Gio.VolumeMonitor, "get", return_value=Mock(get_mounts=Mock(return_value=[mount]))), \
+                 patch.object(daemon.dbus, "_get_gsconnect_device_host", return_value="192.0.2.1"):
+                daemon._process_mount(mount)
+                device = gmm.DeviceInfo(id=device_id, name="Pixel", backend="gsconnect")
+                directory = cfg.mount_structure_dir / gmm.managed_device_name(device)
+                self.assertEqual((directory / "Internal").resolve(), internal)
+                initial_bookmarks = cfg.bookmark_file.read_text()
+                self.assertIn(directory.as_uri(), initial_bookmarks)
+                daemon._process_mount(mount)
+                self.assertEqual(cfg.bookmark_file.read_text(), initial_bookmarks)
+                daemon._on_mount_removed(None, mount)
+                self.assertFalse((directory / "Internal").is_symlink())
+                daemon._process_mount(mount)
+                self.assertEqual((directory / "Internal").resolve(), internal)
+                self.assertEqual(cfg.bookmark_file.read_text(), initial_bookmarks)
+
+    def test_last_connection_requires_lan_and_valid_device_id(self):
+        from unittest.mock import Mock, patch
+        helper = gmm.DBusHelper()
+        schema = Mock()
+        schema.has_key.return_value = True
+        source = Mock()
+        source.lookup.return_value = schema
+        settings = Mock()
+        with patch.object(gmm.Gio.SettingsSchemaSource, "get_default", return_value=source), \
+             patch.object(gmm.Gio.Settings, "new_full", return_value=settings) as new_settings:
+            settings.get_string.return_value = "lan://192.0.2.1:1716"
+            self.assertEqual(helper._get_gsconnect_device_host("abc123"), "192.0.2.1")
+            settings.get_string.return_value = "lan://[2001:db8::1]:1716"
+            self.assertEqual(helper._get_gsconnect_device_host("abc123"), "2001:db8::1")
+            settings.get_string.return_value = "bluetooth://12:34"
+            self.assertIsNone(helper._get_gsconnect_device_host("abc123"))
+            new_settings.reset_mock()
+            self.assertIsNone(helper._get_gsconnect_device_host("../other"))
+            new_settings.assert_not_called()
+
+    def test_unmatched_mount_logs_missing_device_host_at_info_level(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            daemon = gmm.GMMDaemon(gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks"))
+            daemon.dbus.get_all_devices = lambda: [gmm.DeviceInfo(id="phone", name="Pixel", backend="gsconnect", host=None)]
+            mount = Mock()
+            mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.1:1739/"
+            mount.get_default_location.return_value.get_path.return_value = str(root)
+            with self.assertLogs(level="INFO") as messages:
+                daemon._process_mount(mount)
+            self.assertIn("0 connected devices matched its host", messages.output[0])
+            self.assertIn("1 connected devices have no known host address", messages.output[0])
+            self.assertNotIn("192.0.2.1", messages.output[0])
+
+    def test_doctor_explains_that_existing_mount_may_not_be_matched(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as tmp:
+            cli = gmm.CLI(gmm.Config(bookmark_file=Path(tmp) / "bookmarks"))
+            cli.dbus.detect_backends = lambda: ["gsconnect"]
+            cli.dbus.get_all_devices = lambda: [gmm.DeviceInfo(id="phone", name="Pixel", backend="gsconnect", is_mounted=False)]
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cli.cmd_doctor()
+            self.assertIn("not detected as mounted", output.getvalue())
+            self.assertIn("SFTP mount is already present", output.getvalue())
+
+    def test_device_discovery_does_not_match_partial_host_or_name(self):
+        from unittest.mock import Mock, patch
+        properties = {"Name": "Pixel", "Paired": True, "Connected": True, "TcpHost": "192.0.2.1"}
+        objects = {"/org/gnome/Shell/Extensions/GSConnect/Device/one":
+                   {"org.gnome.Shell.Extensions.GSConnect.Device": properties}}
+        helper = gmm.DBusHelper()
+        helper.bus = Mock()
+        helper.bus.call_sync.return_value.unpack.return_value = (objects,)
+        mount = Mock()
+        mount.get_root.return_value.get_uri_scheme.return_value = "sftp"
+        mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.10:1739/"
+        mount.get_name.return_value = "Pixel"
+        with patch.object(gmm.Gio.VolumeMonitor, "get", return_value=Mock(get_mounts=Mock(return_value=[mount]))):
+            self.assertFalse(helper.get_gsconnect_devices()[0].is_mounted)
+
 class TestUpdateWorkflow(unittest.TestCase):
     def test_update_runs_downloaded_installer_and_returns_its_status(self):
         from unittest.mock import Mock, patch
