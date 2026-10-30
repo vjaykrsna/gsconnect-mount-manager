@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GMM (GSConnect / KDE Connect Mount Manager) 2.0.2.
+"""GMM (GSConnect / KDE Connect Mount Manager) 2.0.3.
 
 Automatically organizes and provides seamless access to Android device storage
 via GSConnect and KDE Connect. Creates clean GTK bookmarks and local symlinks
@@ -47,7 +47,7 @@ except (ImportError, ValueError):
     Gio = None  # type: ignore
     GLib = None  # type: ignore
 
-__version__ = "2.0.2"
+__version__ = "2.0.3"
 
 # ANSI Colors
 COLOR_RESET = "\033[0m"
@@ -71,7 +71,7 @@ def colorize(text: str, color: str) -> str:
 # =============================================================================
 
 DEFAULT_CONFIG_TOML = """# GMM (GSConnect Mount Manager) Configuration File
-# Version 2.0.2
+# Version 2.0.3
 
 [general]
 # Base directory where device symlinks are organized
@@ -83,7 +83,7 @@ mount_structure_dir = "~/Devices"
 #   "sftp_only"  - Creates direct SFTP bookmarks only (e.g. sftp://host:port/storage/emulated/0)
 #   "local_only" - Creates local directory bookmarks only (file://$HOME/Devices/Phone)
 #   "none"       - Disables bookmark generation
-bookmark_mode = "both"
+bookmark_mode = "sftp_only"
 
 # Show desktop notifications when storage is connected or disconnected
 notifications = true
@@ -114,7 +114,7 @@ level = "INFO"
 @dataclass
 class Config:
     mount_structure_dir: Path = field(default_factory=lambda: Path.home() / "Devices")
-    bookmark_mode: str = "both"  # "both", "sftp_only", "local_only", "none"
+    bookmark_mode: str = "sftp_only"  # "both", "sftp_only", "local_only", "none"
     notifications: bool = True
     auto_mount: bool = True
     auto_cleanup: bool = True
@@ -802,13 +802,15 @@ class BookmarkManager:
 
     def update_device_bookmarks(self, sanitized_name: str, partitions: Dict[str, Path],
                                 sftp_base_uri: str, local_device_dir: Path,
-                                bookmark_mode: str, mount_path: Optional[Path] = None) -> bool:
-        if bookmark_mode == "none":
-            return True
+                                bookmark_mode: str, mount_path: Optional[Path] = None,
+                                display_label: Optional[str] = None) -> bool:
         local_uri = local_device_dir.absolute().as_uri()
+        if bookmark_mode == "none":
+            return self.remove_device_bookmarks(sanitized_name, local_uri)
+        label_text = " ".join((display_label or sanitized_name).split()) or sanitized_name
         additions = []
         if bookmark_mode in ("both", "local_only"):
-            additions.append(f"{local_uri} {sanitized_name}")
+            additions.append(f"{local_uri} {label_text}")
         if bookmark_mode in ("both", "sftp_only"):
             for label, path in partitions.items():
                 try:
@@ -820,7 +822,8 @@ class BookmarkManager:
                     rel = match.group(1) or "" if match else ("/storage/emulated/0" if path.name == "0" else f"/storage/{path.name}")
                 else:
                     rel = "" if str(relative) == "." else "/" + urllib.parse.quote(relative.as_posix(), safe="/")
-                additions.append(f"{sftp_base_uri.rstrip('/')}{rel} {sanitized_name}/{label}")
+                bookmark_label = label_text if len(partitions) == 1 else f"{label_text} / {label}"
+                additions.append(f"{sftp_base_uri.rstrip('/')}{rel} {bookmark_label}")
         def update(lines, state):
             old = state.get(local_uri, [])
             result = [line for line in lines if line not in old]
@@ -840,7 +843,7 @@ class BookmarkManager:
         def remove(lines, state):
             keys = [local_uri] if local_uri else [key for key, entries in state.items()
                 if any(line.partition(" ")[2] == sanitized_name or
-                       line.partition(" ")[2].startswith(sanitized_name + "/") for line in entries)]
+                       line.partition(" ")[2].startswith((sanitized_name + "/", sanitized_name + " / ")) for line in entries)]
             owned = {line for key in keys for line in state.get(key, [])}
             result = [line for line in lines if line not in owned]
             updated = {key: value for key, value in state.items() if key not in keys}
@@ -886,6 +889,7 @@ class ActiveDevice:
     partitions: Dict[str, Path]
     host: Optional[str] = None
     port: Optional[int] = None
+    friendly_name: Optional[str] = None
 
 
 class DeviceController:
@@ -1275,9 +1279,10 @@ class GMMDaemon:
                         active.sanitized_name,
                         local_uri=active.device_dir.resolve().as_uri(),
                     )
+                    self._refresh_bookmarks()
                     self.notifier.notify(
                         "Storage Disconnected",
-                        f"{active.name} storage has been unmounted.",
+                        f"{active.friendly_name or active.name} storage has been unmounted.",
                         icon="media-eject",
                     )
         except Exception as e:
@@ -1330,25 +1335,32 @@ class GMMDaemon:
                 f"No accessible storage partitions found under {mount_path} for {display_name}"
             )
 
-        # Setup local directory and symlinks
+        # The directory name includes a stable ID; the visible label uses the device name.
+        was_active = uri in self.controller.active_devices
         active = self.controller.setup_device(uri, display_name, mount_path, partitions)
         if active:
-            # Update GTK bookmarks
+            active.friendly_name = " ".join(device.name.split()) or "Unknown Device"
+            self._refresh_bookmarks()
+            if not was_active:
+                partition_names = ", ".join(partitions.keys()) or "Storage"
+                self.notifier.notify(
+                    "Storage Connected",
+                    f"{active.friendly_name} ({partition_names}) ready in {active.device_dir}",
+                    icon="phone",
+                    action_path=active.device_dir,
+                )
+
+    def _refresh_bookmarks(self) -> None:
+        """Label active devices by name, disambiguating only matching names."""
+        active_devices = list(self.controller.active_devices.values())
+        for active in active_devices:
+            name = active.friendly_name or active.name
+            duplicate = sum((other.friendly_name or other.name).casefold() == name.casefold()
+                            for other in active_devices) > 1
+            label = f"{name} ({active.sanitized_name.rsplit('_', 1)[-1]})" if duplicate else name
             self.bookmarks.update_device_bookmarks(
-                active.sanitized_name,
-                partitions,
-                uri,
-                active.device_dir,
-                self.config.bookmark_mode,
-                mount_path=mount_path,
-            )
-            # Desktop notification
-            partition_names = ", ".join(partitions.keys()) or "Storage"
-            self.notifier.notify(
-                "Storage Connected",
-                f"{display_name} ({partition_names}) ready in {active.device_dir}",
-                icon="phone",
-                action_path=active.device_dir,
+                active.sanitized_name, active.partitions, active.uri, active.device_dir,
+                self.config.bookmark_mode, mount_path=active.mount_path, display_label=label,
             )
 
     def _resolve_display_name(self, raw_name: str, uri: str) -> str:

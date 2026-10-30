@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
-# GMM (GSConnect / KDE Connect Mount Manager) 2.0.2 Installer
+# GMM (GSConnect / KDE Connect Mount Manager) 2.0.3 Installer
 # -----------------------------------------------------------------------------
 
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
@@ -119,7 +119,7 @@ install_config() {
 mount_structure_dir = "~/Devices"
 
 # GTK bookmark mode: "both", "sftp_only", "local_only", "none"
-bookmark_mode = "both"
+bookmark_mode = "sftp_only"
 
 # Show desktop notifications when storage is connected or disconnected
 notifications = true
@@ -201,7 +201,7 @@ EOF
 
 main() {
     echo "================================================="
-    echo "  GMM (GSConnect / KDE Connect Mount Manager) 2.0.2"
+    echo "  GMM (GSConnect / KDE Connect Mount Manager) 2.0.3"
     echo "================================================="
 
     check_dependencies

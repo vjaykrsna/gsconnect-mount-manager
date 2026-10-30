@@ -73,7 +73,7 @@ class TestConfig(unittest.TestCase):
 
     def test_defaults(self):
         cfg = gmm.Config.load(config_path=Path(self.temp_dir) / "nonexistent.toml")
-        self.assertEqual(cfg.bookmark_mode, "both")
+        self.assertEqual(cfg.bookmark_mode, "sftp_only")
         self.assertTrue(cfg.auto_mount)
         self.assertTrue(cfg.auto_cleanup)
         self.assertTrue(cfg.auto_discover)
@@ -199,6 +199,38 @@ class TestBookmarkManager(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def test_direct_bookmarks_adapt_to_storage_count(self):
+        root = Path(self.temp_dir) / "mount"
+        internal = root / "storage/emulated/0"
+        card = root / "storage/1234-ABCD"
+        internal.mkdir(parents=True)
+        card.mkdir(parents=True)
+        local = Path(self.temp_dir) / "Devices/phone"
+        def update(partitions):
+            self.assertTrue(self.manager.update_device_bookmarks(
+                "phone", partitions, "sftp://192.0.2.1:1739/", local,
+                "sftp_only", mount_path=root, display_label="My Phone"))
+        update({"Internal": internal})
+        self.assertEqual(self.manager.get_bookmarks(), ["sftp://192.0.2.1:1739/storage/emulated/0 My Phone"])
+        update({"Internal": internal, "SDCard": card})
+        self.assertEqual(self.manager.get_bookmarks(), [
+            "sftp://192.0.2.1:1739/storage/emulated/0 My Phone / Internal",
+            "sftp://192.0.2.1:1739/storage/1234-ABCD My Phone / SDCard",
+        ])
+        update({"Internal": internal})
+        self.assertEqual(self.manager.get_bookmarks(), ["sftp://192.0.2.1:1739/storage/emulated/0 My Phone"])
+
+    def test_direct_only_remove_by_name_with_multiple_storage(self):
+        root = Path(self.temp_dir) / "mount"
+        internal = root / "internal"
+        card = root / "sd"
+        internal.mkdir(parents=True)
+        card.mkdir()
+        self.manager.update_device_bookmarks("Phone", {"Internal": internal, "SDCard": card},
+            "sftp://192.0.2.1:1739/", Path(self.temp_dir) / "Devices/Phone", "sftp_only", mount_path=root)
+        self.manager.remove_device_bookmarks("Phone")
+        self.assertEqual(self.manager.get_bookmarks(), [])
+
     def test_add_and_remove_bookmarks(self):
         # Initial bookmarks
         self.bm_file.write_text("file:///home/user/Downloads Downloads\n", encoding="utf-8")
@@ -222,8 +254,8 @@ class TestBookmarkManager(unittest.TestCase):
         content = self.bm_file.read_text(encoding="utf-8")
         self.assertIn("Downloads Downloads", content)
         self.assertIn("file:///home/user/Devices/Pixel_7 Pixel_7", content)
-        self.assertIn("sftp://1.2.3.4:1739/storage/emulated/0 Pixel_7/Internal", content)
-        self.assertIn("sftp://1.2.3.4:1739/storage/3C82-16F4 Pixel_7/SDCard", content)
+        self.assertIn("sftp://1.2.3.4:1739/storage/emulated/0 Pixel_7 / Internal", content)
+        self.assertIn("sftp://1.2.3.4:1739/storage/3C82-16F4 Pixel_7 / SDCard", content)
 
         # 2. Remove bookmarks
         self.manager.remove_device_bookmarks("Pixel_7")
@@ -271,7 +303,7 @@ class TestBookmarkManager(unittest.TestCase):
         )
         self.assertTrue(success)
         content = self.bm_file.read_text(encoding="utf-8")
-        self.assertIn("sftp://192.168.1.50:1739 Pixel_7/Internal", content)
+        self.assertIn("sftp://192.168.1.50:1739 Pixel_7", content)
         self.assertNotIn("storage/gvfs_mount", content)
 
     def test_clean_bookmarks_prefix_protection(self):
@@ -612,6 +644,51 @@ class TestOwnershipSafety(unittest.TestCase):
 
 
 
+
+class TestBookmarkExperience(unittest.TestCase):
+    def test_friendly_labels_and_collisions_follow_active_devices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks", bookmark_mode="local_only")
+            daemon = gmm.GMMDaemon(cfg)
+            first = gmm.DeviceInfo(id="one", name="My Phone", backend="gsconnect")
+            second = gmm.DeviceInfo(id="two", name="My Phone", backend="gsconnect")
+            first_active = daemon.controller.setup_device("sftp://one/", gmm.managed_device_name(first), root, {"Internal": root})
+            first_active.friendly_name = first.name
+            daemon._refresh_bookmarks()
+            lines = cfg.bookmark_file.read_text().splitlines()
+            self.assertEqual(lines, [f"{first_active.device_dir.as_uri()} My Phone"])
+            second_active = daemon.controller.setup_device("sftp://two/", gmm.managed_device_name(second), root, {"Internal": root})
+            second_active.friendly_name = second.name
+            daemon._refresh_bookmarks()
+            lines = cfg.bookmark_file.read_text().splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertTrue(all(" My Phone (" in line for line in lines))
+            self.assertNotEqual(lines[0].split(" ", 1)[1], lines[1].split(" ", 1)[1])
+            daemon.controller.teardown_device("sftp://two/")
+            daemon.bookmarks.remove_device_bookmarks(second_active.sanitized_name, second_active.device_dir.as_uri())
+            daemon._refresh_bookmarks()
+            self.assertEqual(cfg.bookmark_file.read_text().splitlines(), [f"{first_active.device_dir.as_uri()} My Phone"])
+
+    def test_switch_to_no_bookmarks_removes_only_owned_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bookmarks = root / "bookmarks"
+            bookmarks.write_text("file:///other My Phone\n")
+            manager = gmm.BookmarkManager(bookmarks)
+            device_dir = root / "Devices/phone"
+            manager.update_device_bookmarks("phone", {}, "sftp://host", device_dir, "local_only", display_label="My Phone")
+            manager.update_device_bookmarks("phone", {}, "sftp://host", device_dir, "none", display_label="My Phone")
+            self.assertEqual(bookmarks.read_text().splitlines(), ["file:///other My Phone"])
+
+    def test_existing_bookmark_and_notification_choices_are_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text('[general]\nbookmark_mode = "both"\nnotifications = false\n')
+            cfg = gmm.Config.load(path)
+            self.assertEqual(cfg.bookmark_mode, "both")
+            self.assertFalse(cfg.notifications)
+
 class TestGSConnectHostDiscovery(unittest.TestCase):
     def test_device_host_comes_from_last_connection_and_marks_mount(self):
         from unittest.mock import Mock, patch
@@ -661,7 +738,7 @@ class TestGSConnectHostDiscovery(unittest.TestCase):
                 directory = cfg.mount_structure_dir / gmm.managed_device_name(device)
                 self.assertEqual((directory / "Internal").resolve(), internal)
                 initial_bookmarks = cfg.bookmark_file.read_text()
-                self.assertIn(directory.as_uri(), initial_bookmarks)
+                self.assertIn("sftp://192.0.2.1:1739/storage/emulated/0 Pixel", initial_bookmarks)
                 daemon._process_mount(mount)
                 self.assertEqual(cfg.bookmark_file.read_text(), initial_bookmarks)
                 daemon._on_mount_removed(None, mount)

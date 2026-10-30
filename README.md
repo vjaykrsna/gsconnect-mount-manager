@@ -28,7 +28,7 @@ When opening an Android device via GSConnect or KDE Connect, file managers defau
     └── SDCard   -> /run/user/1000/gvfs/sftp:.../storage/3C82-16F4
 ```
 
-* **File Manager:** Click `Pixel_7` in the sidebar to browse storage directly.
+* **File Manager:** Click the phone name in the sidebar to browse storage directly. A phone with multiple storage locations gets one bookmark per location.
 * **Terminal & CLI:** Access storage seamlessly via `cd ~/Devices/Pixel_7_0123456789/Internal`.
 
 ---
@@ -61,7 +61,7 @@ chmod +x install.sh
 * **⚡ Zero Polling (0% CPU at idle)** – Pure event-driven daemon using `Gio.VolumeMonitor`. No background loops, no battery drain.
 * **📱 Multi-Device Support** – Simultaneously tracks multiple phones and tablets without state collision.
 * **💾 Smart Storage Auto-Discovery** – Automatically discovers Internal Storage (`/storage/emulated/0`) and MicroSD/USB-OTG drives (detecting volume UUIDs like `3C82-16F4`) out of the box.
-* **🔖 IP-Immune Bookmarks** – Creates local directory bookmarks that stay working even when your phone changes Wi-Fi IP addresses.
+* **🔖 Direct Storage Bookmarks** – Opens phone storage directly in the file manager; bookmarks update when the phone reconnects at a different IP address.
 * **🛡️ Safer Cleanup** – Tracks its own links and bookmark entries. Bookmark writes use atomic replacement and a lock shared by GMM processes; concurrent edits by other applications may still conflict.
 
 ---
@@ -97,8 +97,8 @@ Settings are stored in `~/.config/gmm/config.toml`:
 # Base directory where device folders are organized
 mount_structure_dir = "~/Devices"
 
-# Bookmark mode: "both", "sftp_only", "local_only", "none"
-bookmark_mode = "both"
+# Bookmark mode: "local_only", "both", "sftp_only", "none"
+bookmark_mode = "sftp_only"
 
 # Desktop notifications on mount/unmount
 notifications = true
@@ -129,7 +129,8 @@ GMM manages an SFTP mount only when its host matches exactly one connected,
 paired device. For GSConnect, it can read the device's last LAN connection from
 GSConnect settings. If the address is unavailable or the match is ambiguous,
 the mount is skipped. Device folder names include a stable ID suffix to avoid
-collisions. Links and bookmarks created by older versions without ownership
+collisions; sidebar bookmarks use the phone's name and show an identifier only
+when active phones share a name. Existing settings are preserved when updating. Links and bookmarks created by older versions without ownership
 records are preserved and may need to be removed manually.
 </details>
 
