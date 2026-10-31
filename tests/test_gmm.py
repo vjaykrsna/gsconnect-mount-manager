@@ -1,840 +1,407 @@
 #!/usr/bin/env python3
-"""Comprehensive unit tests for GMM."""
-
-import os
-import shutil
-import tempfile
-import unittest
-from pathlib import Path
-
-# Add project root to sys.path
-import sys
+"""Storage access and ownership regressions; never touches a real device or session."""
 import importlib.util
 from importlib.machinery import SourceFileLoader
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace as NS
+import unittest
+from unittest.mock import patch
 
-ROOT_DIR = Path(__file__).parent.parent.resolve()
-sys.path.insert(0, str(ROOT_DIR))
-
-# Dynamically import the extensionless `gmm` script
-gmm_path = ROOT_DIR / "gmm"
-loader = SourceFileLoader("gmm", str(gmm_path))
-spec = importlib.util.spec_from_loader("gmm", loader)
-if spec is None:
-    raise ImportError("Could not create module spec for gmm")
+ROOT = Path(__file__).resolve().parent.parent
+loader = SourceFileLoader('gmm', str(ROOT / 'gmm'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
 gmm = importlib.util.module_from_spec(spec)
-sys.modules["gmm"] = gmm
+sys.modules[spec.name] = gmm
 loader.exec_module(gmm)
 
 
-class TestNameSanitizer(unittest.TestCase):
-    """Test device name sanitization and path safety checks."""
-
-    def test_normal_names(self):
-        self.assertEqual(gmm.sanitize_device_name("Pixel 7"), "Pixel_7")
-        self.assertEqual(gmm.sanitize_device_name("Galaxy-S21"), "Galaxy-S21")
-        self.assertEqual(gmm.sanitize_device_name("iPad.Mini"), "iPad.Mini")
-
-    def test_unsafe_and_special_characters(self):
-        # Traversal and forbidden chars
-        self.assertEqual(gmm.sanitize_device_name("../../../etc/passwd"), "etc_passwd")
-        self.assertEqual(gmm.sanitize_device_name("Phone /with/ slashes"), "Phone_with_slashes")
-        self.assertEqual(gmm.sanitize_device_name("Phone:Special?*<>|Chars"), "Phone_Special_Chars")
-
-    def test_empty_and_whitespace(self):
-        self.assertEqual(gmm.sanitize_device_name(""), "Unknown_Device")
-        self.assertEqual(gmm.sanitize_device_name("    "), "Unknown_Device")
-        self.assertEqual(gmm.sanitize_device_name("..."), "Unknown_Device")
-
-    def test_truncation(self):
-        long_name = "A" * 100
-        sanitized = gmm.sanitize_device_name(long_name)
-        self.assertLessEqual(len(sanitized), 64)
-
-    def test_path_safety(self):
-        base = Path("/home/user/Devices")
-        safe_child = Path("/home/user/Devices/Pixel_7")
-        unsafe_child = Path("/home/user/Pixel_7")
-        unsafe_traversal = Path("/home/user/Devices/../../etc")
-
-        self.assertTrue(gmm.is_safe_subpath(safe_child, base))
-        self.assertFalse(gmm.is_safe_subpath(unsafe_child, base))
-        self.assertFalse(gmm.is_safe_subpath(unsafe_traversal, base))
-
-
-class TestConfig(unittest.TestCase):
-    """Test configuration loading and defaults."""
-
+class IsolatedTest(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.cfg_file = Path(self.temp_dir) / "config.toml"
-
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-    def test_defaults(self):
-        cfg = gmm.Config.load(config_path=Path(self.temp_dir) / "nonexistent.toml")
-        self.assertEqual(cfg.bookmark_mode, "sftp_only")
-        self.assertTrue(cfg.auto_mount)
-        self.assertTrue(cfg.auto_cleanup)
-        self.assertTrue(cfg.auto_discover)
-        self.assertEqual(cfg.log_level, "INFO")
-
-    def test_load_custom_toml(self):
-        toml_content = """
-        [general]
-        mount_structure_dir = "/tmp/my_devices"
-        bookmark_mode = "sftp_only"
-        auto_mount = false
-        notifications = false
-
-        [storage]
-        auto_discover = true
-        exclude_directories = ["custom_ex"]
-        custom_paths = ["/storage/custom:MyFolder"]
-
-        [logging]
-        level = "DEBUG"
-        """
-        self.cfg_file.write_text(toml_content, encoding="utf-8")
-        cfg = gmm.Config.load(config_path=self.cfg_file)
-
-        self.assertEqual(cfg.mount_structure_dir, Path("/tmp/my_devices"))
-        self.assertEqual(cfg.bookmark_mode, "sftp_only")
-        self.assertFalse(cfg.auto_mount)
-        self.assertFalse(cfg.notifications)
-        self.assertEqual(cfg.exclude_directories, ["custom_ex"])
-        self.assertEqual(cfg.custom_paths, ["/storage/custom:MyFolder"])
-        self.assertEqual(cfg.log_level, "DEBUG")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.home = self.root / 'home'
+        self.home.mkdir()
+        self.addCleanup(patch.stopall)
+        patch.object(Path, 'home', return_value=self.home).start()
+        patch.dict(os.environ, {'XDG_CONFIG_HOME': str(self.root / 'config'),
+                                'XDG_STATE_HOME': str(self.root / 'state')}).start()
+        self.config = gmm.Config(directory=self.home / 'Devices')
 
 
-class TestStorageScanner(unittest.TestCase):
-    """Test dynamic storage and SD Card UUID detection."""
+class FakeReader:
+    def __init__(self, readable=(), directories=None):
+        self.accessible = set(readable)
+        self.listings = directories or {}
+        self.calls = []
 
+    def directories(self, uri):
+        self.calls.append(('directories', uri))
+        if uri not in self.listings:
+            raise PermissionError(uri)
+        return self.listings[uri]
+
+    def readable(self, uri):
+        self.calls.append(('readable', uri))
+        if uri not in self.accessible:
+            raise PermissionError(uri)
+        return True
+
+
+class StorageTests(IsolatedTest):
     def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.mount_root = Path(self.temp_dir) / "gvfs_mount"
-        self.mount_root.mkdir(parents=True)
-        self.config = gmm.Config()
-        self.scanner = gmm.StorageScanner(self.config)
+        super().setUp()
+        self.uri = 'sftp://192.0.2.1:1739/'
+        self.mount = gmm.Mount('gsconnect:phone', 'Phone', self.root / 'mounted', self.uri)
+        self.internal = self.uri + 'storage/emulated/0'
 
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
+    def test_multiple_mounts_of_one_phone_and_nested_shortcut(self):
+        base = self.internal
+        camera = base + '/DCIM'
+        other = self.uri + 'storage/1234-ABCD'
+        mounts = [gmm.Mount('gsconnect:phone', 'Phone', self.root / 'a', base, {'Internal': ''}),
+                  gmm.Mount('gsconnect:phone', 'Phone', self.root / 'b', other, {'SD card': ''}),
+                  gmm.Mount('gsconnect:phone', 'Phone', self.root / 'c', camera, {'Camera': ''})]
+        result = gmm.scan(self.config, mounts, FakeReader([base+'/', other+'/', camera+'/']))
+        self.assertEqual({e['name'] for e in result['entries']}, {'Phone_Internal', 'Phone_SD_card'})
+        self.assertEqual(len(result['devices']), 1)
 
-    def test_detect_internal_storage(self):
-        internal = self.mount_root / "storage" / "emulated" / "0"
-        internal.mkdir(parents=True)
+    def test_inaccessible_root_does_not_block_known_child(self):
+        reader = FakeReader([self.internal])
+        result = gmm.scan(self.config, [self.mount], reader)
+        self.assertEqual(len(result['entries']), 1)
+        entry = result['entries'][0]
+        self.assertEqual(entry['uri'], self.internal)
+        self.assertEqual(entry['label'], 'Phone')
+        self.assertEqual(entry['name'], 'Phone')
+        self.assertEqual(entry['target'], str(self.mount.local / 'storage/emulated/0'))
 
-        partitions = self.scanner.discover(self.mount_root)
-        self.assertIn("Internal", partitions)
-        self.assertEqual(partitions["Internal"], internal)
+    def test_empty_internal_storage_is_still_usable(self):
+        reader = FakeReader([self.internal], {self.internal: []})
+        self.assertEqual(gmm.storage_paths(self.mount, self.config, reader), {'Internal': 'storage/emulated/0'})
 
-    def test_detect_sd_card_uuid(self):
-        sd_card = self.mount_root / "storage" / "3C82-16F4"
-        sd_card.mkdir(parents=True)
+    def test_internal_and_sd_card_get_separate_direct_entries(self):
+        card = self.uri + 'storage/1234-ABCD'
+        reader = FakeReader([self.internal, card], {self.uri + 'storage': ['self', 'emulated', '1234-ABCD']})
+        entries = gmm.scan(self.config, [self.mount], reader)['entries']
+        self.assertEqual({e['name'] for e in entries}, {'Phone_Internal', 'Phone_SD_card'})
+        self.assertEqual({e['label'] for e in entries}, {'Phone / Internal', 'Phone / SD card'})
+        self.assertEqual({e['uri'] for e in entries}, {self.internal, card})
 
-        partitions = self.scanner.discover(self.mount_root)
-        self.assertIn("SDCard", partitions)
-        self.assertEqual(partitions["SDCard"], sd_card)
+    def test_unusable_storage_produces_no_fallback_root_entry(self):
+        reader = FakeReader([], {self.uri: ['storage', 'system', 'vendor']})
+        snapshot = gmm.scan(self.config, [self.mount], reader)
+        self.assertEqual(snapshot['entries'], [])
+        self.assertFalse(snapshot['devices'][self.mount.device_id]['ready'])
+        self.assertTrue(any('no usable storage' in note for note in snapshot['notes']))
 
-    def test_detect_multiple_sd_cards(self):
-        sd1 = self.mount_root / "storage" / "1234-ABCD"
-        sd2 = self.mount_root / "storage" / "5678-EF01"
-        sd1.mkdir(parents=True)
-        sd2.mkdir(parents=True)
+    def test_already_exposed_storage_root_is_used(self):
+        reader = FakeReader([], {self.uri: ['DCIM', 'Download']})
+        result = gmm.scan(self.config, [self.mount], reader)
+        self.assertEqual(result['entries'][0]['uri'], self.uri)
+        self.assertEqual(result['entries'][0]['target'], str(self.mount.local))
 
-        partitions = self.scanner.discover(self.mount_root)
-        self.assertIn("SDCard", partitions)
-        self.assertIn("SDCard-2", partitions)
+    def test_remote_entry_can_work_without_local_fuse_projection(self):
+        self.mount.local = None
+        snapshot = gmm.scan(self.config, [self.mount], FakeReader([self.internal]))
+        self.assertEqual(snapshot['entries'][0]['uri'], self.internal)
+        self.assertIsNone(snapshot['entries'][0]['target'])
+        self.assertTrue(any('terminal links' in note for note in snapshot['notes']))
 
-    def test_exclude_directories(self):
-        excluded = self.mount_root / "storage" / "self"
-        excluded.mkdir(parents=True)
+    def test_configured_path_is_quoted_and_does_not_escape_mount(self):
+        self.config.custom_paths = ['/storage/My files:Work']
+        uri = self.uri + 'storage/My%20files'
+        entries = gmm.scan(self.config, [self.mount], FakeReader([uri]))['entries']
+        self.assertEqual(entries[0]['uri'], uri)
+        self.assertEqual(entries[0]['target'], str(self.mount.local / 'storage/My files'))
+        with self.assertRaises(ValueError):
+            gmm.child_uri(self.uri, '../private')
 
-        partitions = self.scanner.discover(self.mount_root)
-        self.assertNotIn("self", partitions)
+    def test_duplicate_phone_names_get_distinct_stable_labels(self):
+        other = gmm.Mount('gsconnect:second', 'Phone', self.root / 'second', 'sftp://192.0.2.2:1739/')
+        reader = FakeReader([self.internal, other.uri + 'storage/emulated/0'])
+        first = gmm.scan(self.config, [self.mount, other], reader)['entries']
+        reverse = gmm.scan(self.config, [other, self.mount], reader)['entries']
+        self.assertEqual(len({e['label'] for e in first}), 2)
+        self.assertEqual({e['id']: e['label'] for e in first}, {e['id']: e['label'] for e in reverse})
+        self.assertTrue(all(e['label'].startswith('Phone (') for e in first))
 
-    def test_saf_root_fallback(self):
-        # When Android SAF mounts directly expose folders like DCIM / Download at root
-        (self.mount_root / "DCIM").mkdir()
-        (self.mount_root / "Download").mkdir()
+    def test_distinct_names_with_same_filesystem_spelling_do_not_clobber(self):
+        self.mount.name = 'A/B'
+        other = gmm.Mount('gsconnect:second', 'A B', self.root / 'second', 'sftp://192.0.2.2:1739/')
+        entries = gmm.scan(self.config, [self.mount, other], FakeReader([self.internal, other.uri + 'storage/emulated/0']))['entries']
+        self.assertEqual(len({e['name'] for e in entries}), 2)
+        self.assertTrue(all('/' not in e['name'] for e in entries))
 
-        partitions = self.scanner.discover(self.mount_root)
-        self.assertIn("Internal", partitions)
-        self.assertEqual(partitions["Internal"], self.mount_root)
-
-    def test_custom_paths_traversal_prevention(self):
-        cfg = gmm.Config(custom_paths=["../../etc:System"])
-        scanner = gmm.StorageScanner(cfg)
-        partitions = scanner.discover(self.mount_root)
-        self.assertNotIn("System", partitions)
-
-    def test_saf_subdirectory_discovery(self):
-        internal_sub = self.mount_root / "Internal storage"
-        sd_sub = self.mount_root / "SD card"
-        internal_sub.mkdir()
-        sd_sub.mkdir()
-
-        partitions = self.scanner.discover(self.mount_root)
-        self.assertIn("Internal", partitions)
-        self.assertEqual(partitions["Internal"], internal_sub)
-        self.assertIn("SDCard", partitions)
-        self.assertEqual(partitions["SDCard"], sd_sub)
-
-    def test_generic_storage_fallback(self):
-        # A custom exposed directory with files (e.g. Music share)
-        (self.mount_root / "song.mp3").write_text("audio")
-        partitions = self.scanner.discover(self.mount_root)
-        self.assertIn("Storage", partitions)
-        self.assertEqual(partitions["Storage"], self.mount_root)
+    def test_kde_camera_shortcut_does_not_count_as_second_storage(self):
+        self.mount.paths = {'Internal': 'storage/emulated/0', 'Camera': 'storage/emulated/0/DCIM'}
+        entries = gmm.scan(self.config, [self.mount], FakeReader([self.internal, self.internal + '/DCIM']))['entries']
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['label'], 'Phone')
 
 
-class TestBookmarkManager(unittest.TestCase):
-    """Test GTK bookmark modifications and file safety."""
-
+class ArtifactTests(IsolatedTest):
     def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.bm_file = Path(self.temp_dir) / "bookmarks"
-        self.manager = gmm.BookmarkManager(self.bm_file)
+        super().setUp()
+        self.artifacts = gmm.Artifacts(self.root / 'owned', self.root / 'gtk/bookmarks')
+        self.target = self.root / 'mounted/storage/emulated/0'
+        self.target.mkdir(parents=True)
+        self.entry = {'id': 'phone:internal', 'uri': 'sftp://192.0.2.1:1739/storage/emulated/0',
+                      'label': 'Phone', 'name': 'Phone', 'target': str(self.target)}
 
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
+    def contents(self):
+        return self.artifacts.bookmarks.read_text().splitlines()
 
-    def test_direct_bookmarks_adapt_to_storage_count(self):
-        root = Path(self.temp_dir) / "mount"
-        internal = root / "storage/emulated/0"
-        card = root / "storage/1234-ABCD"
-        internal.mkdir(parents=True)
-        card.mkdir(parents=True)
-        local = Path(self.temp_dir) / "Devices/phone"
-        def update(partitions):
-            self.assertTrue(self.manager.update_device_bookmarks(
-                "phone", partitions, "sftp://192.0.2.1:1739/", local,
-                "sftp_only", mount_path=root, display_label="My Phone"))
-        update({"Internal": internal})
-        self.assertEqual(self.manager.get_bookmarks(), ["sftp://192.0.2.1:1739/storage/emulated/0 My Phone"])
-        update({"Internal": internal, "SDCard": card})
-        self.assertEqual(self.manager.get_bookmarks(), [
-            "sftp://192.0.2.1:1739/storage/emulated/0 My Phone / Internal",
-            "sftp://192.0.2.1:1739/storage/1234-ABCD My Phone / SDCard",
-        ])
-        update({"Internal": internal})
-        self.assertEqual(self.manager.get_bookmarks(), ["sftp://192.0.2.1:1739/storage/emulated/0 My Phone"])
+    def write_bookmarks(self, lines):
+        self.artifacts.bookmarks.parent.mkdir(parents=True, exist_ok=True)
+        self.artifacts.bookmarks.write_text('\n'.join(lines) + '\n')
 
-    def test_direct_only_remove_by_name_with_multiple_storage(self):
-        root = Path(self.temp_dir) / "mount"
-        internal = root / "internal"
-        card = root / "sd"
-        internal.mkdir(parents=True)
+    def test_repeated_reconciliation_is_idempotent_and_preserves_unrelated_bookmarks(self):
+        user = ['file:///home/example/Documents Documents', 'sftp://192.0.2.9/home Work server']
+        self.write_bookmarks(user)
+        self.artifacts.reconcile(self.config, [self.entry])
+        before = self.artifacts.path.read_bytes()
+        self.artifacts.reconcile(self.config, [self.entry])
+        self.assertEqual(self.artifacts.path.read_bytes(), before)
+        self.assertEqual(self.contents(), user + [self.entry['uri'] + ' Phone'])
+        self.assertEqual(os.readlink(self.config.directory / 'Phone'), str(self.target))
+        self.artifacts.reconcile(self.config, [])
+        self.assertEqual(self.contents(), user)
+        self.assertFalse(os.path.lexists(self.config.directory / 'Phone'))
+
+    def test_preexisting_identical_bookmark_is_not_claimed(self):
+        line = self.entry['uri'] + ' Phone'
+        self.write_bookmarks([line])
+        self.artifacts.reconcile(self.config, [self.entry])
+        self.artifacts.reconcile(self.config, [])
+        self.assertEqual(self.contents(), [line])
+
+    def test_restart_can_remove_old_entries_from_persisted_ownership(self):
+        self.artifacts.reconcile(self.config, [self.entry])
+        restarted = gmm.Artifacts(self.artifacts.directory, self.artifacts.bookmarks)
+        restarted.reconcile(self.config, [])
+        self.assertEqual(self.contents(), [])
+        self.assertFalse(os.path.lexists(self.config.directory / 'Phone'))
+
+    def test_single_to_multiple_to_single_removes_old_owned_paths(self):
+        self.artifacts.reconcile(self.config, [self.entry])
+        card = self.root / 'mounted/storage/1234-ABCD'
         card.mkdir()
-        self.manager.update_device_bookmarks("Phone", {"Internal": internal, "SDCard": card},
-            "sftp://192.0.2.1:1739/", Path(self.temp_dir) / "Devices/Phone", "sftp_only", mount_path=root)
-        self.manager.remove_device_bookmarks("Phone")
-        self.assertEqual(self.manager.get_bookmarks(), [])
-
-    def test_add_and_remove_bookmarks(self):
-        # Initial bookmarks
-        self.bm_file.write_text("file:///home/user/Downloads Downloads\n", encoding="utf-8")
-
-        partitions = {
-            "Internal": Path("/run/user/1000/gvfs/sftp:host=1.2.3.4,port=1739/storage/emulated/0"),
-            "SDCard": Path("/run/user/1000/gvfs/sftp:host=1.2.3.4,port=1739/storage/3C82-16F4"),
-        }
-        local_dir = Path("/home/user/Devices/Pixel_7")
-
-        # 1. Update in "both" mode
-        success = self.manager.update_device_bookmarks(
-            sanitized_name="Pixel_7",
-            partitions=partitions,
-            sftp_base_uri="sftp://1.2.3.4:1739/",
-            local_device_dir=local_dir,
-            bookmark_mode="both",
-        )
-        self.assertTrue(success)
-
-        content = self.bm_file.read_text(encoding="utf-8")
-        self.assertIn("Downloads Downloads", content)
-        self.assertIn("file:///home/user/Devices/Pixel_7 Pixel_7", content)
-        self.assertIn("sftp://1.2.3.4:1739/storage/emulated/0 Pixel_7 / Internal", content)
-        self.assertIn("sftp://1.2.3.4:1739/storage/3C82-16F4 Pixel_7 / SDCard", content)
-
-        # 2. Remove bookmarks
-        self.manager.remove_device_bookmarks("Pixel_7")
-        content_after = self.bm_file.read_text(encoding="utf-8")
-        self.assertIn("Downloads Downloads", content_after)
-        self.assertNotIn("Pixel_7", content_after)
-
-    def test_clean_bookmarks_with_url_encoding(self):
-        devices_dir = Path(self.temp_dir) / "Devices"
-        devices_dir.mkdir(parents=True)
-        valid_phone = devices_dir / "My Phone"
-        valid_phone.mkdir(parents=True)
-
-        # Write bookmarks: one valid with spaces, one dead with spaces, one outside devices
-        dead_uri = (devices_dir / "Dead Phone").as_uri()
-        valid_uri = valid_phone.as_uri()
-        outside_uri = "file:///home/user/Documents Documents"
-
-        self.bm_file.write_text(
-            f"{outside_uri}\n{dead_uri} Dead Phone\n{valid_uri} My Phone\n",
-            encoding="utf-8",
-        )
-
-        removed = self.manager.clean_bookmarks(devices_dir)
-        self.assertEqual(removed, 0)
-
-        content = self.bm_file.read_text(encoding="utf-8")
-        self.assertIn(outside_uri, content)
-        self.assertIn("My Phone", content)
-        self.assertIn("Dead Phone", content)
-
-    def test_saf_root_bookmark_uri_generation(self):
-        mount_root = Path(self.temp_dir) / "gvfs_mount"
-        mount_root.mkdir(parents=True, exist_ok=True)
-        partitions = {"Internal": mount_root}
-        local_dir = Path("/home/user/Devices/Pixel_7")
-
-        success = self.manager.update_device_bookmarks(
-            sanitized_name="Pixel_7",
-            partitions=partitions,
-            sftp_base_uri="sftp://192.168.1.50:1739/",
-            local_device_dir=local_dir,
-            bookmark_mode="sftp_only",
-            mount_path=mount_root,
-        )
-        self.assertTrue(success)
-        content = self.bm_file.read_text(encoding="utf-8")
-        self.assertIn("sftp://192.168.1.50:1739 Pixel_7", content)
-        self.assertNotIn("storage/gvfs_mount", content)
-
-    def test_clean_bookmarks_prefix_protection(self):
-        devices_dir = Path(self.temp_dir) / "Devices"
-        devices_dir.mkdir(parents=True, exist_ok=True)
-
-        # Sibling directory starting with the same prefix
-        archive_uri = "file:///tmp/Devices_Archive Devices_Archive"
-        dead_device_uri = (devices_dir / "Dead_Phone").as_uri() + " Dead_Phone"
-
-        self.bm_file.write_text(f"{archive_uri}\n{dead_device_uri}\n", encoding="utf-8")
-        removed = self.manager.clean_bookmarks(devices_dir)
-        self.assertEqual(removed, 0)
-
-        content = self.bm_file.read_text(encoding="utf-8")
-        self.assertIn(archive_uri, content)
-        self.assertIn("Dead_Phone", content)
-
-    def test_device_bookmark_label_exact_match(self):
-        user_bookmark = "file:///home/user/Work My Pixel_7"
-        device_bookmark = "file:///home/user/Devices/Pixel_7 Pixel_7"
-        self.bm_file.write_text(f"{user_bookmark}\n{device_bookmark}\n", encoding="utf-8")
-
-        self.manager.remove_device_bookmarks("Pixel_7")
-        content = self.bm_file.read_text(encoding="utf-8")
-        self.assertIn(user_bookmark, content)
-        self.assertIn(device_bookmark, content)
-
-
-class TestDeviceController(unittest.TestCase):
-    """Test symlink creation and cleanup."""
-
-    def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.base_dir = Path(self.temp_dir) / "Devices"
-        self.base_dir.mkdir(parents=True)
-        self.config = gmm.Config(mount_structure_dir=self.base_dir)
-        self.controller = gmm.DeviceController(self.config)
-
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-    def test_setup_and_teardown(self):
-        # Create dummy target directories
-        target_internal = Path(self.temp_dir) / "gvfs_internal"
-        target_internal.mkdir(parents=True)
-
-        partitions = {"Internal": target_internal}
-        uri = "sftp://192.168.1.50:1739/"
-
-        # Setup
-        active = self.controller.setup_device(
-            uri=uri,
-            display_name="Pixel 7",
-            mount_path=Path(self.temp_dir),
-            partitions=partitions,
-        )
-        self.assertIsNotNone(active)
-        device_dir = self.base_dir / "Pixel_7"
-        self.assertTrue(device_dir.exists())
-        symlink = device_dir / "Internal"
-        self.assertTrue(symlink.is_symlink())
-        self.assertEqual(symlink.resolve(), target_internal.resolve())
-
-        # Teardown
-        removed = self.controller.teardown_device(uri)
-        self.assertEqual(removed, active)
-        self.assertFalse(symlink.exists())
-        self.assertFalse(device_dir.exists())
-        # Stray base directory is also cleaned up when empty
-        self.assertFalse(self.base_dir.exists())
-
-
-class TestCLICommands(unittest.TestCase):
-    """Test CLI commands and diagnostic reporting."""
-
-    def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.config = gmm.Config(
-            mount_structure_dir=Path(self.temp_dir) / "Devices",
-            bookmark_file=Path(self.temp_dir) / "bookmarks",
-        )
-        self.cli = gmm.CLI(self.config)
-        # Mock D-Bus so unit tests never touch real devices or system mounts
-        self.cli.dbus.get_all_devices = lambda: []
-        self.cli.dbus.is_available = lambda: True
-        self.cli._mount_device = lambda dev: True
-        self.cli._unmount_device = lambda dev: None
-
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-    def test_doctor_export_mode(self):
-        import io
-        from contextlib import redirect_stdout
-
-        f = io.StringIO()
-        with redirect_stdout(f):
-            ret = self.cli.cmd_doctor(export=True)
-
-        self.assertEqual(ret, 0)
-        output = f.getvalue()
-        self.assertIn("GMM System Diagnostics", output)
-        self.assertIn("Python Version", output)
-        self.assertIn("```text", output)
-
-    def test_clean_command(self):
-        ret = self.cli.cmd_clean()
-        self.assertEqual(ret, 0)
-
-    def test_mount_unmount_no_args(self):
-        ret_mount = self.cli.cmd_mount()
-        self.assertEqual(ret_mount, 0)
-        ret_unmount = self.cli.cmd_unmount()
-        self.assertEqual(ret_unmount, 0)
-
-    def test_device_matching_by_sanitized_name(self):
-        sample_dev = gmm.DeviceInfo(
-            id="dev123",
-            name="My Pixel 7",
-            is_reachable=True,
-            is_mounted=False,
-            backend="kdeconnect",
-        )
-        self.cli.dbus.get_all_devices = lambda: [sample_dev]
-
-        # Exact match
-        self.assertEqual(self.cli.dbus.find_device_by_name_or_id("My Pixel 7"), sample_dev)
-        # Case insensitive
-        self.assertEqual(self.cli.dbus.find_device_by_name_or_id("my pixel 7"), sample_dev)
-        # Sanitized name with underscores
-        self.assertEqual(self.cli.dbus.find_device_by_name_or_id("My_Pixel_7"), sample_dev)
-        # By ID
-        self.assertEqual(self.cli.dbus.find_device_by_name_or_id("dev123"), sample_dev)
-        # Nonexistent
-        self.assertIsNone(self.cli.dbus.find_device_by_name_or_id("iPhone"))
-
-    def test_device_matching_empty_query(self):
-        sample_dev = gmm.DeviceInfo(
-            id="dev123",
-            name="My Pixel 7",
-            is_reachable=True,
-            is_mounted=False,
-            backend="kdeconnect",
-        )
-        self.cli.dbus.get_all_devices = lambda: [sample_dev]
-
-        # Empty or whitespace query should NOT match the first device
-        self.assertIsNone(self.cli.dbus.find_device_by_name_or_id(""))
-        self.assertIsNone(self.cli.dbus.find_device_by_name_or_id("   "))
-
-    def test_config_command(self):
-        import io
-        from contextlib import redirect_stdout
-
-        f = io.StringIO()
-        with redirect_stdout(f):
-            ret = self.cli.cmd_config()
-        self.assertEqual(ret, 0)
-        out = f.getvalue()
-        self.assertIn("GMM Configuration", out)
-        self.assertIn("mount_structure_dir", out)
-
-        # Show path
-        f_path = io.StringIO()
-        with redirect_stdout(f_path):
-            ret_path = self.cli.cmd_config(show_path=True)
-        self.assertEqual(ret_path, 0)
-        self.assertIn("config.toml", f_path.getvalue())
-
-    def test_unmount_offline_device_directory_cleanup(self):
-        # Create a managed device directory
-        dev_dir = self.config.mount_structure_dir / "Pixel_7"
-        dev_dir.mkdir(parents=True, exist_ok=True)
-        dummy_link = dev_dir / "Internal"
-        dummy_link.symlink_to(self.temp_dir)
-
-        # Device is not on D-Bus
-        self.cli.dbus.get_all_devices = lambda: []
-
-        ret = self.cli.cmd_unmount("Pixel 7")
-        self.assertEqual(ret, 0)
-        self.assertTrue(dummy_link.is_symlink())
-        self.assertTrue(dev_dir.exists())
-
-    def test_status_with_custom_mount_structure_dir(self):
-        custom_base = Path(self.temp_dir) / "PhoneStorage"
-        custom_base.mkdir(parents=True, exist_ok=True)
-        cfg = gmm.Config(
-            mount_structure_dir=custom_base,
-            bookmark_file=Path(self.temp_dir) / "bookmarks",
-        )
-        cli = gmm.CLI(cfg)
-
-        # Write bookmark matching custom base directory
-        cfg.bookmark_file.write_text(
-            f"file://{custom_base}/Pixel_7 Pixel_7\n", encoding="utf-8"
-        )
-
-        import io
-        from contextlib import redirect_stdout
-
-        f = io.StringIO()
-        with redirect_stdout(f):
-            ret = cli.cmd_status()
-        self.assertEqual(ret, 0)
-        out = f.getvalue()
-        self.assertIn("file://", out)
-        self.assertIn("Pixel_7", out)
-
-
-
-class TestOwnershipSafety(unittest.TestCase):
-    def test_same_name_devices_have_distinct_stable_paths(self):
-        first = gmm.DeviceInfo(id="one", name="Pixel 7", backend="gsconnect")
-        second = gmm.DeviceInfo(id="two", name="Pixel_7", backend="gsconnect")
-        self.assertNotEqual(gmm.managed_device_name(first), gmm.managed_device_name(second))
-        self.assertEqual(gmm.managed_device_name(first), gmm.managed_device_name(first))
-
-    def test_setup_and_teardown_preserve_unowned_links(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp) / "Devices"
-            device_dir = base / "Phone"
-            device_dir.mkdir(parents=True)
-            target = Path(tmp) / "storage"
-            target.mkdir()
-            user_link = device_dir / "UserLink"
-            user_link.symlink_to(target)
-            controller = gmm.DeviceController(gmm.Config(mount_structure_dir=base))
-            controller.setup_device("sftp://phone/", "Phone", target, {"Internal": target})
-            controller.teardown_device("sftp://phone/")
-            self.assertTrue(user_link.is_symlink())
-            self.assertFalse((device_dir / "Internal").is_symlink())
-
-    def test_clean_does_not_follow_symlinked_device_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            base = root / "Devices"
-            outside = root / "outside"
-            base.mkdir()
-            outside.mkdir()
-            broken = outside / "broken"
-            broken.symlink_to(root / "missing")
-            (base / "Phone").symlink_to(outside, target_is_directory=True)
-            cli = gmm.CLI(gmm.Config(mount_structure_dir=base, bookmark_file=root / "bookmarks"))
-            cli.cmd_clean()
-            self.assertTrue(broken.is_symlink())
-
-    def test_bookmark_removal_preserves_same_label_user_bookmark(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            bookmarks = root / "bookmarks"
-            user_entry = "file:///somewhere/else Phone"
-            bookmarks.write_text(user_entry + "\n")
-            manager = gmm.BookmarkManager(bookmarks)
-            local = root / "Devices" / "Phone"
-            manager.update_device_bookmarks("Phone", {}, "sftp://host", local, "local_only")
-            manager.remove_device_bookmarks("Phone", local.as_uri())
-            self.assertEqual(bookmarks.read_text().splitlines(), [user_entry])
-
-    def test_daemon_ignores_unmatched_or_ambiguous_mounts(self):
-        from unittest.mock import Mock
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            cfg = gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks")
-            daemon = gmm.GMMDaemon(cfg)
-            mount = Mock()
-            mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.1/"
-            mount.get_default_location.return_value.get_path.return_value = str(root)
-            daemon.controller.setup_device = Mock()
-            other = gmm.DeviceInfo(id="one", name="Phone", backend="gsconnect", host="192.0.2.10")
-            daemon.dbus.get_all_devices = lambda: [other]
-            daemon._process_mount(mount)
-            daemon.controller.setup_device.assert_not_called()
-            other.host = "192.0.2.1"
-            second = gmm.DeviceInfo(id="two", name="Phone 2", backend="gsconnect", host=other.host)
-            daemon.dbus.get_all_devices = lambda: [other, second]
-            daemon._process_mount(mount)
-            daemon.controller.setup_device.assert_not_called()
-
-    def test_daemon_processes_unique_matching_host(self):
-        from unittest.mock import Mock
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            cfg = gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks")
-            daemon = gmm.GMMDaemon(cfg)
-            mount = Mock()
-            mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.1/"
-            mount.get_default_location.return_value.get_path.return_value = str(root)
-            device = gmm.DeviceInfo(id="one", name="Phone", backend="gsconnect", host="192.0.2.1")
-            daemon.dbus.get_all_devices = lambda: [device]
-            daemon.scanner.discover = Mock(return_value={})
-            daemon.controller.setup_device = Mock(return_value=None)
-            daemon._process_mount(mount)
-            daemon.controller.setup_device.assert_called_once()
-            self.assertEqual(daemon.controller.setup_device.call_args.args[1], gmm.managed_device_name(device))
-
-    def test_failed_unmount_preserves_managed_links(self):
-        from unittest.mock import Mock
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            cfg = gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks")
-            device = gmm.DeviceInfo(id="one", name="Phone", backend="gsconnect")
-            controller = gmm.DeviceController(cfg)
-            active = controller.setup_device("sftp://host/", gmm.managed_device_name(device), root, {"Internal": root})
-            cli = gmm.CLI(cfg)
-            cli.dbus.unmount_gsconnect_device = Mock(return_value=False)
-            self.assertFalse(cli._unmount_device(device))
-            self.assertTrue((active.device_dir / "Internal").is_symlink())
-
-    def test_unmount_all_does_not_touch_unrelated_gio_mounts(self):
-        from unittest.mock import Mock, patch
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            cli = gmm.CLI(gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks"))
-            cli.dbus.get_all_devices = lambda: []
-            gio = Mock()
-            with patch.object(gmm, "Gio", gio), patch.object(gmm, "HAS_GI", True):
-                cli.cmd_unmount()
-            gio.VolumeMonitor.get.assert_not_called()
-
-    def test_purge_keeps_custom_config_parent(self):
-        from unittest.mock import patch
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            custom = root / "documents" / "custom.toml"
-            custom.parent.mkdir()
-            custom.write_text("[general]\n")
-            sibling = custom.parent / "important.txt"
-            sibling.write_text("keep")
-            cfg = gmm.Config(config_path=custom, mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks")
-            cli = gmm.CLI(cfg)
-            with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(root / "xdg"), "XDG_BIN_HOME": str(root / "bin")}):
-                with patch.object(gmm.subprocess, "run"):
-                    cli.cmd_uninstall(purge=True, confirm=True)
-            self.assertTrue(custom.exists())
-            self.assertTrue(sibling.exists())
-
-
-
-
-class TestBookmarkExperience(unittest.TestCase):
-    def test_friendly_labels_and_collisions_follow_active_devices(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            cfg = gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks", bookmark_mode="local_only")
-            daemon = gmm.GMMDaemon(cfg)
-            first = gmm.DeviceInfo(id="one", name="My Phone", backend="gsconnect")
-            second = gmm.DeviceInfo(id="two", name="My Phone", backend="gsconnect")
-            first_active = daemon.controller.setup_device("sftp://one/", gmm.managed_device_name(first), root, {"Internal": root})
-            first_active.friendly_name = first.name
-            daemon._refresh_bookmarks()
-            lines = cfg.bookmark_file.read_text().splitlines()
-            self.assertEqual(lines, [f"{first_active.device_dir.as_uri()} My Phone"])
-            second_active = daemon.controller.setup_device("sftp://two/", gmm.managed_device_name(second), root, {"Internal": root})
-            second_active.friendly_name = second.name
-            daemon._refresh_bookmarks()
-            lines = cfg.bookmark_file.read_text().splitlines()
-            self.assertEqual(len(lines), 2)
-            self.assertTrue(all(" My Phone (" in line for line in lines))
-            self.assertNotEqual(lines[0].split(" ", 1)[1], lines[1].split(" ", 1)[1])
-            daemon.controller.teardown_device("sftp://two/")
-            daemon.bookmarks.remove_device_bookmarks(second_active.sanitized_name, second_active.device_dir.as_uri())
-            daemon._refresh_bookmarks()
-            self.assertEqual(cfg.bookmark_file.read_text().splitlines(), [f"{first_active.device_dir.as_uri()} My Phone"])
-
-    def test_switch_to_no_bookmarks_removes_only_owned_entries(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            bookmarks = root / "bookmarks"
-            bookmarks.write_text("file:///other My Phone\n")
-            manager = gmm.BookmarkManager(bookmarks)
-            device_dir = root / "Devices/phone"
-            manager.update_device_bookmarks("phone", {}, "sftp://host", device_dir, "local_only", display_label="My Phone")
-            manager.update_device_bookmarks("phone", {}, "sftp://host", device_dir, "none", display_label="My Phone")
-            self.assertEqual(bookmarks.read_text().splitlines(), ["file:///other My Phone"])
-
-    def test_existing_bookmark_and_notification_choices_are_preserved(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.toml"
-            path.write_text('[general]\nbookmark_mode = "both"\nnotifications = false\n')
-            cfg = gmm.Config.load(path)
-            self.assertEqual(cfg.bookmark_mode, "both")
-            self.assertFalse(cfg.notifications)
-
-class TestGSConnectHostDiscovery(unittest.TestCase):
-    def test_device_host_comes_from_last_connection_and_marks_mount(self):
-        from unittest.mock import Mock, patch
-        device_id = "a" * 32
-        properties = {"Id": device_id, "Name": "Pixel", "Paired": True, "Connected": True}
-        objects = {"/org/gnome/Shell/Extensions/GSConnect/Device/" + device_id:
-                   {"org.gnome.Shell.Extensions.GSConnect.Device": properties}}
-        bus = Mock()
-        bus.call_sync.return_value.unpack.return_value = (objects,)
-        helper = gmm.DBusHelper()
-        helper.bus = bus
-        mount = Mock()
-        mount.get_root.return_value.get_uri_scheme.return_value = "sftp"
-        mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.1:1739/"
-        with patch.object(gmm.Gio.VolumeMonitor, "get", return_value=Mock(get_mounts=Mock(return_value=[mount]))), \
-             patch.object(helper, "_get_gsconnect_device_host", return_value="192.0.2.1") as lookup:
-            devices = helper.get_gsconnect_devices()
-        lookup.assert_called_once_with(device_id)
-        self.assertEqual(len(devices), 1)
-        self.assertEqual(devices[0].host, "192.0.2.1")
-        self.assertTrue(devices[0].is_mounted)
-
-    def test_reported_mount_creates_links_and_bookmarks(self):
-        from unittest.mock import Mock, patch
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            mount_path = root / "mounted"
-            internal = mount_path / "storage/emulated/0"
-            internal.mkdir(parents=True)
-            cfg = gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks", notifications=False)
-            daemon = gmm.GMMDaemon(cfg)
-            device_id = "a" * 32
-            objects = {"/org/gnome/Shell/Extensions/GSConnect/Device/" + device_id:
-                       {"org.gnome.Shell.Extensions.GSConnect.Device":
-                        {"Id": device_id, "Name": "Pixel", "Paired": True, "Connected": True}}}
-            daemon.dbus.bus = Mock()
-            daemon.dbus.bus.call_sync.return_value.unpack.return_value = (objects,)
-            daemon.dbus.get_kdeconnect_devices = lambda: []
-            mount = Mock()
-            mount.get_root.return_value.get_uri_scheme.return_value = "sftp"
-            mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.1:1739/"
-            mount.get_default_location.return_value.get_path.return_value = str(mount_path)
-            with patch.object(gmm.Gio.VolumeMonitor, "get", return_value=Mock(get_mounts=Mock(return_value=[mount]))), \
-                 patch.object(daemon.dbus, "_get_gsconnect_device_host", return_value="192.0.2.1"):
-                daemon._process_mount(mount)
-                device = gmm.DeviceInfo(id=device_id, name="Pixel", backend="gsconnect")
-                directory = cfg.mount_structure_dir / gmm.managed_device_name(device)
-                self.assertEqual((directory / "Internal").resolve(), internal)
-                initial_bookmarks = cfg.bookmark_file.read_text()
-                self.assertIn("sftp://192.0.2.1:1739/storage/emulated/0 Pixel", initial_bookmarks)
-                daemon._process_mount(mount)
-                self.assertEqual(cfg.bookmark_file.read_text(), initial_bookmarks)
-                daemon._on_mount_removed(None, mount)
-                self.assertFalse((directory / "Internal").is_symlink())
-                daemon._process_mount(mount)
-                self.assertEqual((directory / "Internal").resolve(), internal)
-                self.assertEqual(cfg.bookmark_file.read_text(), initial_bookmarks)
-
-    def test_last_connection_requires_lan_and_valid_device_id(self):
-        from unittest.mock import Mock, patch
-        helper = gmm.DBusHelper()
-        schema = Mock()
-        schema.has_key.return_value = True
-        source = Mock()
-        source.lookup.return_value = schema
-        settings = Mock()
-        with patch.object(gmm.Gio.SettingsSchemaSource, "get_default", return_value=source), \
-             patch.object(gmm.Gio.Settings, "new_full", return_value=settings) as new_settings:
-            settings.get_string.return_value = "lan://192.0.2.1:1716"
-            self.assertEqual(helper._get_gsconnect_device_host("abc123"), "192.0.2.1")
-            settings.get_string.return_value = "lan://[2001:db8::1]:1716"
-            self.assertEqual(helper._get_gsconnect_device_host("abc123"), "2001:db8::1")
-            settings.get_string.return_value = "bluetooth://12:34"
-            self.assertIsNone(helper._get_gsconnect_device_host("abc123"))
-            new_settings.reset_mock()
-            self.assertIsNone(helper._get_gsconnect_device_host("../other"))
-            new_settings.assert_not_called()
-
-    def test_unmatched_mount_logs_missing_device_host_at_info_level(self):
-        from unittest.mock import Mock
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            daemon = gmm.GMMDaemon(gmm.Config(mount_structure_dir=root / "Devices", bookmark_file=root / "bookmarks"))
-            daemon.dbus.get_all_devices = lambda: [gmm.DeviceInfo(id="phone", name="Pixel", backend="gsconnect", host=None)]
-            mount = Mock()
-            mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.1:1739/"
-            mount.get_default_location.return_value.get_path.return_value = str(root)
-            with self.assertLogs(level="INFO") as messages:
-                daemon._process_mount(mount)
-            self.assertIn("0 connected devices matched its host", messages.output[0])
-            self.assertIn("1 connected devices have no known host address", messages.output[0])
-            self.assertNotIn("192.0.2.1", messages.output[0])
-
-    def test_doctor_explains_that_existing_mount_may_not_be_matched(self):
-        import io
-        from contextlib import redirect_stdout
-        with tempfile.TemporaryDirectory() as tmp:
-            cli = gmm.CLI(gmm.Config(bookmark_file=Path(tmp) / "bookmarks"))
-            cli.dbus.detect_backends = lambda: ["gsconnect"]
-            cli.dbus.get_all_devices = lambda: [gmm.DeviceInfo(id="phone", name="Pixel", backend="gsconnect", is_mounted=False)]
-            output = io.StringIO()
-            with redirect_stdout(output):
-                cli.cmd_doctor()
-            self.assertIn("not detected as mounted", output.getvalue())
-            self.assertIn("SFTP mount is already present", output.getvalue())
-
-    def test_device_discovery_does_not_match_partial_host_or_name(self):
-        from unittest.mock import Mock, patch
-        properties = {"Name": "Pixel", "Paired": True, "Connected": True, "TcpHost": "192.0.2.1"}
-        objects = {"/org/gnome/Shell/Extensions/GSConnect/Device/one":
-                   {"org.gnome.Shell.Extensions.GSConnect.Device": properties}}
-        helper = gmm.DBusHelper()
-        helper.bus = Mock()
-        helper.bus.call_sync.return_value.unpack.return_value = (objects,)
-        mount = Mock()
-        mount.get_root.return_value.get_uri_scheme.return_value = "sftp"
-        mount.get_root.return_value.get_uri.return_value = "sftp://192.0.2.10:1739/"
-        mount.get_name.return_value = "Pixel"
-        with patch.object(gmm.Gio.VolumeMonitor, "get", return_value=Mock(get_mounts=Mock(return_value=[mount]))):
-            self.assertFalse(helper.get_gsconnect_devices()[0].is_mounted)
-
-class TestUpdateWorkflow(unittest.TestCase):
-    def test_update_runs_downloaded_installer_and_returns_its_status(self):
-        from unittest.mock import Mock, patch
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            cli = gmm.CLI(gmm.Config(bookmark_file=root / "bookmarks"))
-            response = Mock()
-            response.__enter__ = Mock(return_value=response)
-            response.__exit__ = Mock(return_value=False)
-            response.read.return_value = b"#!/bin/bash\necho installer\n"
-            def run_installer(args, check):
-                self.assertEqual(args[0], "bash")
-                self.assertEqual(Path(args[1]).read_bytes(), response.read.return_value)
-                return Mock(returncode=7)
-            with patch("urllib.request.urlopen", return_value=response) as fetch, patch.object(gmm.subprocess, "run", side_effect=run_installer):
-                self.assertEqual(cli.cmd_update(), 7)
-            self.assertTrue(fetch.call_args.args[0].full_url.endswith("/install.sh"))
-
-    def test_update_download_failure_is_reported(self):
-        from unittest.mock import patch
-        with tempfile.TemporaryDirectory() as tmp:
-            cli = gmm.CLI(gmm.Config(bookmark_file=Path(tmp) / "bookmarks"))
-            with patch("urllib.request.urlopen", side_effect=OSError("offline")), patch.object(gmm.subprocess, "run") as run:
-                self.assertEqual(cli.cmd_update(), 1)
-                run.assert_not_called()
-
-if __name__ == "__main__":
+        internal = {**self.entry, 'name': 'Phone_Internal', 'label': 'Phone / Internal'}
+        sd = {**self.entry, 'id': 'phone:sd', 'name': 'Phone_SD_card', 'label': 'Phone / SD card',
+              'target': str(card), 'uri': 'sftp://192.0.2.1:1739/storage/1234-ABCD'}
+        self.artifacts.reconcile(self.config, [internal, sd])
+        self.assertFalse(os.path.lexists(self.config.directory / 'Phone'))
+        self.assertEqual({p.name for p in self.config.directory.iterdir()}, {'Phone_Internal', 'Phone_SD_card'})
+        self.assertEqual(len(self.contents()), 2)
+        self.artifacts.reconcile(self.config, [self.entry])
+        self.assertEqual({p.name for p in self.config.directory.iterdir()}, {'Phone'})
+        self.assertEqual(self.contents(), [self.entry['uri'] + ' Phone'])
+
+    def test_conflicting_file_directory_and_broken_link_are_backed_up(self):
+        for kind in ('file', 'directory', 'symlink'):
+            with self.subTest(kind=kind):
+                cfg = gmm.Config(directory=self.root / kind)
+                cfg.directory.mkdir()
+                conflict = cfg.directory / 'Phone'
+                if kind == 'file':
+                    conflict.write_text('user data')
+                elif kind == 'directory':
+                    conflict.mkdir()
+                    (conflict / 'keep.txt').write_text('user data')
+                else:
+                    conflict.symlink_to(self.root / 'missing')
+                self.artifacts.reconcile(cfg, [self.entry])
+                backups = list(cfg.directory.glob('Phone.gmm-backup-*'))
+                self.assertEqual(len(backups), 1)
+                if kind == 'file':
+                    self.assertEqual(backups[0].read_text(), 'user data')
+                elif kind == 'directory':
+                    self.assertEqual((backups[0] / 'keep.txt').read_text(), 'user data')
+                else:
+                    self.assertEqual(os.readlink(backups[0]), str(self.root / 'missing'))
+                self.assertEqual(os.readlink(conflict), str(self.target))
+                self.artifacts.reconcile(cfg, [])
+                self.assertTrue(os.path.lexists(backups[0]))
+
+    def test_user_modified_link_is_preserved_on_disconnect(self):
+        self.artifacts.reconcile(self.config, [self.entry])
+        link = self.config.directory / 'Phone'
+        link.unlink()
+        link.symlink_to(self.root / 'user-target')
+        self.artifacts.reconcile(self.config, [])
+        self.assertEqual(os.readlink(link), str(self.root / 'user-target'))
+
+    def test_address_change_removes_only_old_owned_bookmark(self):
+        self.artifacts.reconcile(self.config, [self.entry])
+        updated = {**self.entry, 'uri': self.entry['uri'].replace('192.0.2.1', '192.0.2.2')}
+        self.artifacts.reconcile(self.config, [updated])
+        self.assertEqual(self.contents(), [updated['uri'] + ' Phone'])
+
+    def test_v2_bookmark_manifest_migrates_exact_entries(self):
+        old = 'file:///old/Devices/Phone Phone'
+        user = 'sftp://192.0.2.9/ My files'
+        self.write_bookmarks([old, user])
+        self.artifacts.bookmarks.with_name('gmm-bookmarks.json').write_text(json.dumps({'file:///old/Devices/Phone': [old]}))
+        self.artifacts.reconcile(self.config, [self.entry])
+        self.assertEqual(self.contents(), [user, self.entry['uri'] + ' Phone'])
+        self.assertFalse(self.artifacts.bookmarks.with_name('gmm-bookmarks.json').exists())
+
+    def test_corrupt_ownership_prevents_cleanup(self):
+        self.artifacts.directory.mkdir()
+        self.artifacts.path.write_text('{broken')
+        self.write_bookmarks(['file:///home/example/Work Work'])
+        with self.assertRaises(ValueError):
+            self.artifacts.reconcile(self.config, [])
+        self.assertEqual(self.contents(), ['file:///home/example/Work Work'])
+
+
+class ConfigTests(IsolatedTest):
+    def write(self, text):
+        self.config.path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.path.write_text(text)
+
+    def test_major_upgrade_backs_up_and_resets_old_settings_once(self):
+        old = '[general]\nnotifications = false\nmount_structure_dir = ' + json.dumps(str(self.root / 'old-devices')) + '\n'
+        self.write(old)
+        gmm.prepare_config()
+        backups = list(self.config.path.parent.glob('config.toml.gmm-backup-*'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), old)
+        self.assertTrue(gmm.Config.load().notifications)
+        self.write(gmm.DEFAULT_CONFIG.replace('notifications = true', 'notifications = false'))
+        gmm.prepare_config()
+        self.assertFalse(gmm.Config.load().notifications)
+        self.assertEqual(len(list(self.config.path.parent.glob('config.toml.gmm-backup-*'))), 1)
+
+    def test_legacy_links_cleanup_preserves_user_items_and_retargeted_links(self):
+        base = self.root / 'old-devices'
+        folder = base / 'Phone'
+        folder.mkdir(parents=True)
+        (folder / 'Internal').symlink_to('/old/mount')
+        (folder / 'User').symlink_to('/user/changed')
+        (folder / 'notes.txt').write_text('keep')
+        (folder / '.gmm-links.json').write_text(json.dumps({'Internal': '/old/mount', 'User': '/old/user-target'}))
+        self.write('[general]\nmount_structure_dir = ' + json.dumps(str(base)) + '\n')
+        gmm.prepare_config()
+        self.assertFalse(os.path.lexists(folder / 'Internal'))
+        self.assertEqual(os.readlink(folder / 'User'), '/user/changed')
+        self.assertEqual((folder / 'notes.txt').read_text(), 'keep')
+
+    def test_path_traversal_in_custom_storage_is_rejected(self):
+        self.write('version = 3\n[storage]\ncustom_paths = ["../secrets:Bad"]\n')
+        with self.assertRaisesRegex(ValueError, 'custom storage'):
+            gmm.Config.load()
+
+    def test_notifications_requires_boolean(self):
+        self.write('version = 3\n[general]\nnotifications = "false"\n')
+        with self.assertRaisesRegex(ValueError, 'notifications'):
+            gmm.Config.load()
+
+    def test_old_config_requires_explicit_installer_migration(self):
+        self.write('[general]\nnotifications = false\n')
+        with self.assertRaisesRegex(ValueError, 'migrate'):
+            gmm.Config.load()
+
+
+class Bus:
+    def __init__(self, replies):
+        self.replies = replies
+        self.calls = []
+
+    def call_sync(self, service, path, interface, method, parameters, reply_type, flags, timeout, cancel):
+        self.calls.append((service, path, method, flags, timeout, parameters))
+        value = self.replies[method]
+        if isinstance(value, Exception):
+            raise value
+        return NS(unpack=lambda: (value,))
+
+
+def mounted(uri):
+    root = NS(get_uri_scheme=lambda: 'sftp', get_uri=lambda: uri, get_path=lambda: '/tmp/mount')
+    return NS(get_root=lambda: root, get_default_location=lambda: NS(get_path=lambda: '/tmp/mount'))
+
+
+class DiscoveryTests(IsolatedTest):
+    def setup_bus(self, replies, mounts=()):
+        bus = Bus(replies)
+        fake_gio = NS(BusType=NS(SESSION=1), DBusCallFlags=NS(NO_AUTO_START=7),
+                      bus_get_sync=lambda *args: bus,
+                      VolumeMonitor=NS(get=lambda: NS(get_mounts=lambda: mounts)))
+        patch.object(gmm, 'Gio', fake_gio).start()
+        patch.object(gmm, 'GLib', NS(Variant=lambda signature, args: (signature, args))).start()
+        return bus
+
+    def test_gs_matches_unique_phone_and_does_not_adopt_port22(self):
+        phone = {'Paired': True, 'Connected': True, 'Name': 'Phone', 'Id': 'abc'}
+        bus = self.setup_bus({'ListNames': ['org.gnome.Shell.Extensions.GSConnect'],
+            'GetManagedObjects': {'/Device/abc': {'org.gnome.Shell.Extensions.GSConnect.Device': phone}}},
+            [mounted('sftp://192.0.2.1:1739/'), mounted('sftp://192.0.2.1:22/')])
+        with patch.object(gmm, '_gsconnect_host', return_value='192.0.2.1'):
+            mounts, _ = gmm.discover_mounts()
+        self.assertEqual([x.device_id for x in mounts], ['gsconnect:abc'])
+        self.assertTrue(all(x[3:5] == (7, 2000) for x in bus.calls))
+        self.assertFalse(any(x[2] in ('mount', 'mountAndWait', 'startBrowsing', 'Activate') for x in bus.calls))
+
+    def test_ambiguous_host_is_not_owned(self):
+        phone = {'Paired': True, 'Connected': True, 'Name': 'Phone'}
+        objects = {'/Device/' + i: {'org.gnome.Shell.Extensions.GSConnect.Device': {**phone, 'Id': i}}
+                   for i in ('one', 'two')}
+        self.setup_bus({'ListNames': ['org.gnome.Shell.Extensions.GSConnect'], 'GetManagedObjects': objects},
+                       [mounted('sftp://192.0.2.1:1739/')])
+        with patch.object(gmm, '_gsconnect_host', return_value='192.0.2.1'):
+            self.assertEqual(gmm.discover_mounts()[0], [])
+
+    def kde_replies(self):
+        return {'ListNames': ['org.kde.kdeconnect'], 'devices': ['abc'],
+                'GetAll': {'isPaired': True, 'isReachable': True, 'name': 'Phone'},
+                'isMounted': True, 'mountPoint': '/run/user/1000/abc',
+                'getDirectories': {'/run/user/1000/abc/storage/emulated/0': 'All files',
+                                   '/run/user/1000/abc/storage/emulated/0/DCIM': 'Camera',
+                                   '/run/user/1000/abc/../secrets': 'Bad'}}
+
+    def test_kde_existing_sshfs_produces_file_uri_and_reported_paths(self):
+        bus = self.setup_bus(self.kde_replies())
+        with patch.object(gmm, '_sshfs_mount_points', return_value={'/run/user/1000/abc'}):
+            mounts, _ = gmm.discover_mounts()
+        self.assertEqual(mounts[0].uri, 'file:///run/user/1000/abc')
+        self.assertEqual(mounts[0].paths, {'Internal': 'storage/emulated/0', 'Camera': 'storage/emulated/0/DCIM'})
+        self.assertTrue(all(x[3:5] == (7, 2000) for x in bus.calls))
+        self.assertEqual({x[2] for x in bus.calls}, {'ListNames', 'devices', 'GetAll', 'isMounted', 'mountPoint', 'getDirectories'})
+
+    def test_kde_not_mounted_is_not_probed_or_mounted(self):
+        replies = self.kde_replies()
+        replies['isMounted'] = False
+        bus = self.setup_bus(replies)
+        with patch.object(gmm, '_sshfs_mount_points', return_value=set()):
+            self.assertEqual(gmm.discover_mounts()[0], [])
+        self.assertNotIn('getDirectories', [x[2] for x in bus.calls])
+
+    def test_kde_stale_reported_mount_does_not_create_storage(self):
+        bus = self.setup_bus(self.kde_replies())
+        with patch.object(gmm, '_sshfs_mount_points', return_value=set()):
+            self.assertEqual(gmm.discover_mounts()[0], [])
+        self.assertNotIn('getDirectories', [x[2] for x in bus.calls])
+
+    def test_failed_snapshot_raises_rather_than_removing_all_entries(self):
+        self.setup_bus({'ListNames': ['org.kde.kdeconnect'], 'devices': RuntimeError('timeout')})
+        with self.assertRaisesRegex(RuntimeError, 'timeout'):
+            gmm.discover_mounts()
+
+    def test_missing_backend_is_not_activated(self):
+        bus = self.setup_bus({'ListNames': []})
+        self.assertEqual(gmm.discover_mounts()[0], [])
+        self.assertEqual(len(bus.calls), 1)
+
+    def test_mountinfo_escaping(self):
+        content = '12 10 0:2 / /run/user/1000/a\\040b rw - fuse.sshfs kdeconnect@192.0.2.1:/ rw\n'
+        with patch.object(Path, 'read_text', return_value=content):
+            self.assertEqual(gmm._sshfs_mount_points(), {'/run/user/1000/a b'})
+
+
+if __name__ == '__main__':
     unittest.main()

@@ -1,167 +1,123 @@
-# GMM (GSConnect / KDE Connect Mount Manager)
+# GMM — GSConnect / KDE Connect Mount Manager
 
-<p align="left">
-  <a href="https://www.kernel.org"><img src="https://img.shields.io/badge/platform-Linux-blue.svg" alt="Platform"></a>
-  <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.11+-brightgreen.svg" alt="Python"></a>
-  <a href="#"><img src="https://img.shields.io/badge/desktop-GNOME%20%7C%20KDE%20%7C%20XFCE-orange.svg" alt="Desktop Environments"></a>
-  <a href="#"><img src="https://img.shields.io/badge/idle%20CPU-0%25%20(event--driven)-success.svg" alt="Zero Polling"></a>
-</p>
+GSConnect or KDE Connect can mount an Android phone at `/`, even when that location is inaccessible. GMM finds the usable storage inside an existing mount and gives you a direct way to open it.
 
-Seamless, zero-polling Android storage integration for Linux desktops. Automatically maps internal storage and SD cards into clean local folders and bookmarks when connecting via **GSConnect** or **KDE Connect**.
+GMM **never requests a mount or unmount**. Use GSConnect or KDE Connect to mount your phone first. GMM cannot fix a failed SFTP connection or grant Android storage permissions.
 
----
+## What you get
 
-## 🎯 The Problem & The Fix
+For a phone with one storage location, a sidebar entry named after the phone opens storage directly. A phone with multiple locations gets entries such as **Phone / Internal** and **Phone / SD card**. Names get a short identifier only when needed to distinguish devices.
 
-When opening an Android device via GSConnect or KDE Connect, file managers default to the unreadable SFTP root (`/`), triggering permission errors:
-
-<p align="center">
-  <img src="./error.png" alt="Nautilus SFTP Error" width="480">
-</p>
-
-**GMM eliminates this completely.** It detects mounts in real-time and organizes accessible storage directly in your user directory and file manager sidebar:
+Terminal links are created directly inside `~/Devices`:
 
 ```text
-~/Devices/
-└── Pixel_7_0123456789/
-    ├── Internal -> /run/user/1000/gvfs/sftp:.../storage/emulated/0
-    └── SDCard   -> /run/user/1000/gvfs/sftp:.../storage/3C82-16F4
+# One storage location
+~/Devices/Phone -> accessible storage
+
+# Multiple storage locations
+~/Devices/Phone_Internal -> internal storage
+~/Devices/Phone_SD_card  -> SD card
 ```
 
-* **File Manager:** Click the phone name in the sidebar to browse storage directly. A phone with multiple storage locations gets one bookmark per location.
-* **Terminal & CLI:** Access storage seamlessly via `cd ~/Devices/Pixel_7_0123456789/Internal`.
+GMM updates its entries when storage changes and removes them when the mount disappears. An existing local item that conflicts with a link is backed up before replacement. GMM never deletes the contents of that item to make room for a link.
 
----
+The file manager's native network mount may remain visible alongside GMM's entry. GMM does not hide or modify that native entry.
 
-## ⚡ Quick Install
+## Supported environment
 
-Run this in your terminal (no git clone required):
+- Linux desktop with a paired phone and a working GSConnect or KDE Connect mount.
+- Python 3.11+ and PyGObject with GIO/GLib bindings.
+- A GTK file manager for sidebar bookmarks. **Dolphin Places integration is not implemented.** KDE Connect backend support does not imply Dolphin bookmark support.
+- GVfs with its SFTP backend for GSConnect; KDE Connect uses its existing SSHFS mount.
+- A systemd user session for automatic service startup, or run `gmm daemon` yourself.
+
+GSConnect entries use the existing SFTP URI. KDE Connect entries use paths inside its existing local SSHFS mount; they do not open a new SFTP connection. Terminal links use the local mount path. A direct sidebar entry avoids routing file manager browsing through GMM's symlink, but does not guarantee faster transfers or navigation.
+
+GMM observes existing mounts and periodically checks for changes to recover from missed events. It does not continually request mounts.
+
+## Install and update
+
+Run as your regular user:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main/install.sh | bash
 ```
 
-> **Note:** Run as your regular user (do **not** use `sudo`). Installs `gmm` to `~/.local/bin/gmm` and enables the user systemd service. To update later, run `gmm update`; it uses the same installer and preserves your configuration.
+Or clone this repository and run `bash install.sh`. The installer checks dependencies, installs `~/.local/bin/gmm` and starts `gmm.service` in your user session. Add `~/.local/bin` to your shell's PATH if needed.
 
-<details>
-<summary><b>Or install via Git clone</b></summary>
-
-```bash
-git clone https://github.com/vjaykrsna/gsconnect-mount-manager.git
-cd gsconnect-mount-manager
-chmod +x install.sh
-./install.sh
-```
-</details>
-
----
-
-## ✨ Features
-
-* **⚡ Zero Polling (0% CPU at idle)** – Pure event-driven daemon using `Gio.VolumeMonitor`. No background loops, no battery drain.
-* **📱 Multi-Device Support** – Simultaneously tracks multiple phones and tablets without state collision.
-* **💾 Smart Storage Auto-Discovery** – Automatically discovers Internal Storage (`/storage/emulated/0`) and MicroSD/USB-OTG drives (detecting volume UUIDs like `3C82-16F4`) out of the box.
-* **🔖 Direct Storage Bookmarks** – Opens phone storage directly in the file manager; bookmarks update when the phone reconnects at a different IP address.
-* **🛡️ Safer Cleanup** – Tracks its own links and bookmark entries. Bookmark writes use atomic replacement and a lock shared by GMM processes; concurrent edits by other applications may still conflict.
-
----
-
-## 💻 CLI Usage
-
-GMM includes a standalone management CLI:
+To update later:
 
 ```bash
-gmm status            # View connected devices, active mounts, and bookmarks
-gmm list              # List all paired GSConnect / KDE Connect devices
-gmm mount             # Mount all online devices (or: gmm mount "Pixel 7")
-gmm unmount           # Unmount all devices & clean up (or: gmm unmount "Pixel 7")
-gmm clean             # Clean up stale symlinks and dead bookmarks
-gmm config            # Inspect active settings (or: gmm config --init)
-gmm doctor            # Check system health & dependencies
-gmm doctor --export   # Generate Markdown diagnostics (review for private data)
-gmm update            # Rerun the installer for the latest version from GitHub
-gmm uninstall         # Remove GMM and its background service
+gmm update
 ```
 
----
+Update runs the same installer. It downloads from the repository's `main` branch.
 
-<details>
-<summary><b>⚙️ Configuration (<code>~/.config/gmm/config.toml</code>)</b></summary>
+## Commands
 
-<br>
+```bash
+gmm status       # Current phone storage and GMM entries
+gmm doctor       # Diagnose why storage access is unavailable
+gmm --version
+gmm update
+gmm uninstall
+```
 
-Settings are stored in `~/.config/gmm/config.toml`:
+The background service runs `gmm daemon`. Service controls remain available through systemd:
+
+```bash
+systemctl --user restart gmm
+systemctl --user status gmm --no-pager
+journalctl --user -u gmm -n 100 --no-pager
+```
+
+Uninstall removes GMM's service, executable and tracked entries. It leaves the native phone mount alone. Configuration is retained unless you choose `gmm uninstall --purge`.
+
+## Advanced settings
+
+Edit `~/.config/gmm/config.toml`, then restart the service. Defaults work without editing:
 
 ```toml
+version = 3
+
 [general]
-# Base directory where device folders are organized
 mount_structure_dir = "~/Devices"
-
-# Bookmark mode: "local_only", "both", "sftp_only", "none"
-bookmark_mode = "sftp_only"
-
-# Desktop notifications on mount/unmount
 notifications = true
 
-# Automatically mount when device connects to Wi-Fi
-auto_mount = true
-
-# Clean up empty device folders on disconnect
-auto_cleanup = true
-
 [storage]
-# Automatically discover Internal and SD Card UUID partitions
-auto_discover = true
-
-# Exclude internal Android pseudo-directories
-exclude_directories = ["self", "knox", "legacy", "sdcard"]
-
-# Optional custom storage paths: ["/path:Label"]
+# Optional paths relative to the existing mount, with display labels.
 custom_paths = []
+# Example: custom_paths = ["/storage/custom:Shared"]
 
 [logging]
 level = "INFO"
 ```
 
-To apply changes: `systemctl --user restart gmm`
+Notifications can be disabled with `notifications = false`. GMM reports storage becoming available or disappearing, and a useful failure message when a matched mount has no accessible storage. Diagnostics remain available when notifications are disabled.
 
-GMM manages an SFTP mount only when its host matches exactly one connected,
-paired device. For GSConnect, it can read the device's last LAN connection from
-GSConnect settings. If the address is unavailable or the match is ambiguous,
-the mount is skipped. Device folder names include a stable ID suffix to avoid
-collisions; sidebar bookmarks use the phone's name and show an identifier only
-when active phones share a name. Existing settings are preserved when updating. Links and bookmarks created by older versions without ownership
-records are preserved and may need to be removed manually.
-</details>
+GMM respects `XDG_CONFIG_HOME` and `XDG_BIN_HOME` for its configuration and installed executable.
 
----
+## Upgrading from GMM 1.x or 2.x
 
-<details>
-<summary><b>❓ Troubleshooting & FAQ</b></summary>
+**3.0 is a breaking change.** On the first upgrade, the old configuration is saved with a dated backup and replaced with the new defaults. This resets custom paths, notification preferences, bookmark modes and other old settings. The installer reports the backup; reapply supported preferences using the configuration above. Later updates within the new configuration format preserve your settings.
 
-<br>
+The new defaults create direct sidebar entries and flat terminal links, enable notifications, and never request mounts. Old GMM-owned entries are migrated only when their ownership can be established. Untracked files and bookmarks are left alone.
 
-* **Device paired, but storage doesn't appear?**  
-  Open KDE Connect on your phone $\rightarrow$ tap your computer $\rightarrow$ **Plugin Settings** $\rightarrow$ enable **Filesystem expose** (Storage access).
-* **Firewall issues?**  
-  Ensure ports **1716–1764 (TCP & UDP)** are allowed in your firewall (`sudo ufw allow 1716:1764/udp && sudo ufw allow 1716:1764/tcp`).
-* **Changing the mount folder:**  
-  Change `mount_structure_dir = "~/PhoneStorage"` in `~/.config/gmm/config.toml`, then restart: `systemctl --user restart gmm`.
-* **Diagnostics:**  
-  Run `gmm --version`, `gmm doctor`, and `gmm status`. For service logs, run
-  `journalctl --user -u gmm -n 50 --no-pager`. Review the output for private
-  information before sharing it.
-</details>
+The `list`, `mount`, `unmount`, `clean` and `config` commands have been removed. Use `status` for an overview, GSConnect/KDE Connect for mounting, and edit the config file for settings. Cleanup happens as part of storage reconciliation and uninstall.
 
----
+## Troubleshooting
 
-<details>
-<summary><b>🧪 Testing & Development</b></summary>
+Start with `gmm doctor`. The important distinction is whether the phone has no native mount, has a mount but no accessible storage path, or has accessible storage but no GMM entry.
 
-<br>
+If there is no native mount, check GSConnect/KDE Connect and the Android app's filesystem access permissions. If the mount exists but opening its root fails, GMM should provide access to a readable storage location. If it cannot identify one, it reports that failure instead of creating an entry to a known unusable location.
 
-Run the unit test suite:
+For a bug report, use the repository's [bug report template](.github/ISSUE_TEMPLATE/bug_report.md). Logs may include details about your device or computer, so check them before posting and remove anything you’d rather keep private.
+
+## Development
+
 ```bash
-python3 tests/test_gmm.py
+python3 -m unittest discover -s tests
+bash -n install.sh
 ```
-</details>
+
+Tests cover logic and failure handling. They do not replace testing the native mount and actual file manager on each supported desktop. See [storage research](GMM-STORAGE-RESEARCH.md) for the evidence and limitations behind this design.

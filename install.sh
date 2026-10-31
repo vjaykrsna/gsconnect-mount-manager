@@ -1,223 +1,94 @@
 #!/usr/bin/env bash
+# GMM 3.0.0 — installs the same executable used by `gmm update`.
 set -euo pipefail
 
-# -----------------------------------------------------------------------------
-# GMM (GSConnect / KDE Connect Mount Manager) 2.0.3 Installer
-# -----------------------------------------------------------------------------
-
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gmm"
 SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-SERVICE_NAME="gmm.service"
-
-SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
-SOURCE_BIN="$SOURCE_DIR/gmm"
 RAW_REPO_URL="https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main"
+SOURCE_DIR=""
+TEMP_BIN=""
+TEMP_UNIT=""
 
-# Output helpers
-info()  { printf "\033[32m[INFO]\033[0m %s\n" "$*"; }
-warn()  { printf "\033[33m[WARN]\033[0m %s\n" "$*"; }
-error() { printf "\033[31m[ERROR]\033[0m %s\n" "$*" >&2; }
+cleanup() {
+    [[ -z "$TEMP_BIN" ]] || rm -f -- "$TEMP_BIN"
+    [[ -z "$TEMP_UNIT" ]] || rm -f -- "$TEMP_UNIT"
+}
+trap cleanup EXIT
 
-# Guard against running as root
 if [[ "$(id -u)" -eq 0 ]]; then
-    error "Do not run install.sh as root or with sudo. GMM runs as a user service."
+    echo "Run this installer as your regular user, without sudo." >&2
     exit 1
 fi
+if ! python3 -c 'import sys; assert sys.version_info >= (3, 11); import gi; gi.require_version("Gio", "2.0"); from gi.repository import Gio, GLib' >/dev/null 2>&1; then
+    echo "GMM requires Python 3.11+ and PyGObject (python3-gi or python-gobject)." >&2
+    exit 1
+fi
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+fi
+BIN_DIR="$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$BIN_DIR")"
+mkdir -p -- "$BIN_DIR"
+TEMP_BIN="$(mktemp "$BIN_DIR/.gmm-install.XXXXXX")"
+if [[ -n "$SOURCE_DIR" && -f "$SOURCE_DIR/gmm" ]]; then
+    cp -- "$SOURCE_DIR/gmm" "$TEMP_BIN"
+elif command -v curl >/dev/null 2>&1; then
+    curl --fail --silent --show-error --location --max-time 60 "$RAW_REPO_URL/gmm" -o "$TEMP_BIN"
+elif command -v wget >/dev/null 2>&1; then
+    wget --quiet --timeout=60 -O "$TEMP_BIN" "$RAW_REPO_URL/gmm"
+else
+    echo "Install curl or wget to download GMM, or run install.sh from a cloned repository." >&2
+    exit 1
+fi
+python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' "$TEMP_BIN"
+chmod 755 "$TEMP_BIN"
 
-check_dependencies() {
-    info "Checking system requirements..."
+# Stop the old daemon before changing its config or owned entries.
+if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet gmm.service; then
+    systemctl --user stop gmm.service
+fi
+if ! "$TEMP_BIN" --prepare-config; then
+    echo "Configuration preparation failed. The previous executable remains installed; the service was not restarted." >&2
+    exit 1
+fi
+mv -f -- "$TEMP_BIN" "$BIN_DIR/gmm"
+TEMP_BIN=""
 
-    if ! command -v python3 >/dev/null 2>&1; then
-        error "Python 3 is required but not installed."
-        exit 1
-    fi
-
-    local py_ok
-    py_ok=$(python3 -c "import sys; print('yes' if sys.version_info >= (3, 11) else 'no')")
-    if [[ "$py_ok" != "yes" ]]; then
-        error "Python 3.11 or newer is required."
-        exit 1
-    fi
-
-    if ! python3 -c "import gi; gi.require_version('Gio', '2.0'); from gi.repository import Gio" >/dev/null 2>&1; then
-        error "PyGObject (python3-gi) is required but missing."
-        echo "Install it via your distribution's package manager:"
-        echo "  Debian/Ubuntu: sudo apt install python3-gi"
-        echo "  Fedora:        sudo dnf install python3-gobject"
-        echo "  Arch Linux:    sudo pacman -S python-gobject"
-        exit 1
-    fi
-
-    info "Prerequisite dependencies satisfied."
-}
-
-install_binary() {
-    info "Installing gmm executable to $BIN_DIR/gmm..."
-    mkdir -p "$BIN_DIR"
-
-    local temp_bin
-    temp_bin="$(mktemp "$BIN_DIR/.gmm-install.XXXXXX")"
-    if [[ -n "$SOURCE_DIR" ]] && [[ -f "$SOURCE_BIN" ]]; then
-        cp "$SOURCE_BIN" "$temp_bin"
-    else
-        info "Fetching gmm from GitHub..."
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsSL "$RAW_REPO_URL/gmm" -o "$temp_bin" || { rm -f "$temp_bin"; return 1; }
-        elif command -v wget >/dev/null 2>&1; then
-            wget -qO "$temp_bin" "$RAW_REPO_URL/gmm" || { rm -f "$temp_bin"; return 1; }
-        else
-            rm -f "$temp_bin"
-            error "Neither curl nor wget found. Cannot download gmm."
-            return 1
-        fi
-    fi
-
-    if ! python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' "$temp_bin"; then
-        rm -f "$temp_bin"
-        error "The downloaded executable failed Python syntax validation."
-        return 1
-    fi
-    chmod +x "$temp_bin"
-    mv -f "$temp_bin" "$BIN_DIR/gmm"
-
-    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-        warn "$BIN_DIR is not currently in your PATH."
-        if [[ -t 0 ]]; then
-            read -p "Would you like to automatically add $BIN_DIR to your shell configuration? (y/N) " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                local shell_rc="$HOME/.bashrc"
-                if [[ "${SHELL:-}" == *"zsh"* ]] && [[ -f "$HOME/.zshrc" ]]; then
-                    shell_rc="$HOME/.zshrc"
-                fi
-                {
-                    echo ""
-                    echo "# Added by GMM installer"
-                    echo "export PATH=\"$BIN_DIR:\$PATH\""
-                } >> "$shell_rc"
-                info "Added PATH export to $shell_rc."
-                info "Run 'source $shell_rc' or restart your terminal to use 'gmm'."
-            fi
-        else
-            warn "Add 'export PATH=\"$BIN_DIR:\$PATH\"' to your ~/.bashrc or ~/.zshrc to use 'gmm' directly."
-        fi
-    fi
-}
-
-install_config() {
-    mkdir -p "$CONFIG_DIR"
-    local target_config="$CONFIG_DIR/config.toml"
-
-    if [[ ! -f "$target_config" ]]; then
-        info "Creating default configuration at $target_config..."
-        cat > "$target_config" <<'EOF'
-# GMM (GSConnect / KDE Connect Mount Manager) Configuration File
-
-[general]
-# Base directory where device symlinks are organized
-mount_structure_dir = "~/Devices"
-
-# GTK bookmark mode: "both", "sftp_only", "local_only", "none"
-bookmark_mode = "sftp_only"
-
-# Show desktop notifications when storage is connected or disconnected
-notifications = true
-
-# Automatically trigger SFTP mounting when a paired device connects to Wi-Fi
-auto_mount = true
-
-# Clean up empty device directories and dangling links on disconnect
-auto_cleanup = true
-
-[storage]
-# Automatically discover Internal and SD Card UUID partitions
-auto_discover = true
-
-# Exclude internal Android pseudo-directories from symlinking
-exclude_directories = ["self", "knox", "legacy", "sdcard"]
-
-# Custom storage paths (optional override). Format: ["/mount/path:DisplayName"]
-custom_paths = []
-
-[logging]
-level = "INFO"
-EOF
-    else
-        info "Configuration file already exists at $target_config. Preserving existing config."
-    fi
-}
-
-install_systemd_service() {
-    if ! command -v systemctl >/dev/null 2>&1; then
-        return
-    fi
-
-    info "Installing systemd user service..."
-    mkdir -p "$SYSTEMD_USER_DIR"
-    cat > "$SYSTEMD_USER_DIR/$SERVICE_NAME" <<EOF
-[Unit]
-Description=GMM (GSConnect / KDE Connect Mount Manager)
-Documentation=https://github.com/vjaykrsna/gsconnect-mount-manager
+if command -v systemctl >/dev/null 2>&1; then
+    mkdir -p -- "$SYSTEMD_USER_DIR"
+    TEMP_UNIT="$(mktemp "$SYSTEMD_USER_DIR/.gmm-service.XXXXXX")"
+    python3 - "$BIN_DIR/gmm" > "$TEMP_UNIT" <<'PY'
+import json
+import sys
+executable = json.dumps(sys.argv[1].replace('%', '%%').replace('$', '$$'), ensure_ascii=False)
+print(f'''[Unit]
+Description=GMM phone storage access
 After=dbus.service
-
-[Service]
-Type=simple
-ExecStart=$BIN_DIR/gmm daemon
-Restart=on-failure
-RestartSec=5
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
+[Service]
+Type=simple
+ExecStart={executable} daemon
+Restart=on-failure
+RestartSec=5
+
 [Install]
 WantedBy=default.target
-EOF
-
-    if ! systemctl --user daemon-reload 2>/dev/null; then
-        warn "Could not reload systemd user daemon (systemd user session may not be active)."
-        warn "You can manually enable the service later with: systemctl --user enable --now $SERVICE_NAME"
-        return
-    fi
-
-    local was_active=false
-    if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        was_active=true
-    fi
-    if systemctl --user enable --now "$SERVICE_NAME" 2>/dev/null; then
-        if [[ "$was_active" == true ]]; then
-            if systemctl --user restart "$SERVICE_NAME" 2>/dev/null; then
-                info "Systemd user service restarted with the updated executable."
-            else
-                warn "The service could not be restarted; run: systemctl --user restart $SERVICE_NAME"
-            fi
-        else
-            info "Systemd user service enabled and started."
-        fi
+''')
+PY
+    chmod 644 "$TEMP_UNIT"
+    mv -f -- "$TEMP_UNIT" "$SYSTEMD_USER_DIR/gmm.service"
+    TEMP_UNIT=""
+    if systemctl --user daemon-reload && systemctl --user enable --now gmm.service; then
+        echo "GMM installed and running. It will wait for GSConnect or KDE Connect to mount your phone."
     else
-        warn "Could not start systemd user service automatically."
-        warn "Start it manually when logged into a systemd session: systemctl --user start $SERVICE_NAME"
+        echo "GMM installed, but its service could not start. From your desktop session, run:"
+        echo "  systemctl --user enable --now gmm.service"
     fi
-}
-
-main() {
-    echo "================================================="
-    echo "  GMM (GSConnect / KDE Connect Mount Manager) 2.0.3"
-    echo "================================================="
-
-    check_dependencies
-    install_binary
-    install_config
-    install_systemd_service
-
-    echo "-------------------------------------------------"
-    info "Installation complete!"
-    echo
-    echo "Useful commands:"
-    echo "  gmm status                  - View connected devices, mounts, and bookmarks"
-    echo "  gmm list                    - List paired devices"
-    echo "  gmm doctor                  - Run diagnostic checks"
-    echo "  systemctl --user status gmm - Check background service status"
-    echo "-------------------------------------------------"
-}
-
-main
+else
+    echo "GMM installed. systemd was not found; run '$BIN_DIR/gmm daemon' in your desktop session."
+fi
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    echo "$BIN_DIR is not in PATH. Add it to your shell's PATH or use $BIN_DIR/gmm directly."
+fi
+echo "Use gmm status or gmm doctor to check storage access."

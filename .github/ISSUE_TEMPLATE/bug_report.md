@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Report a problem with GMM
+about: Report a problem opening phone storage through GMM
 labels: ''
 assignees: ''
 ---
@@ -13,30 +13,33 @@ assignees: ''
 2. Then, ...
 3. Finally, ...
 
-**System and diagnostics**
+**Phone and desktop**
 
-Run the commands below in a terminal just after reproducing the problem. Paste the output in the section below, including any errors.
+- Phone model and Android version:
+- KDE Connect Android app version:
+- Desktop backend: GSConnect or KDE Connect, and its version:
+- File manager: Files/Nautilus, Nemo, Dolphin, or another:
+- Can you mount the phone using GSConnect/KDE Connect itself?
+- Does opening the native mount fail, or only GMM's entry? If a specific storage path works, include it:
 
-<details>
-<summary>Commands to collect diagnostics</summary>
+**Diagnostics**
+
+Run this block just after reproducing the problem. Include command errors too.
 
 ```bash
 gmm --version
 cat /etc/os-release
 echo "Desktop: ${XDG_CURRENT_DESKTOP:-unknown}"
 gmm doctor
-gmm list
 gmm status
-gmm config
 systemctl --user status gmm.service --no-pager -l
 journalctl --user -u gmm -n 100 --no-pager
 ```
-</details>
 
-Before posting, review the output for **usernames, device names and IDs, IP addresses, file paths, custom settings, and other private information**. Replace sensitive values consistently (for example, use `PHONE_IP` everywhere the same IP appears). Do not share passwords or keys. The output is not automatically sanitized.
+The output can include usernames, device names, IP addresses and file paths. Give it a quick look before posting and replace anything you’d rather keep private. Use the same placeholder each time a value appears, such as `PHONE_IP`.
 
 <details>
-<summary>Paste reviewed command output here</summary>
+<summary>Paste reviewed output here</summary>
 
 ```text
 Paste output here
@@ -44,4 +47,4 @@ Paste output here
 </details>
 
 **Anything else that helps?**
-<!-- Include your phone model and Android version, GSConnect or KDE Connect, relevant non-default GMM settings, and a screenshot if useful. Do not share secrets or your entire config unless needed. -->
+<!-- Mention whether this started after an upgrade, any custom storage paths or settings, and a screenshot if useful. Do not share your whole config unless it is needed. -->
