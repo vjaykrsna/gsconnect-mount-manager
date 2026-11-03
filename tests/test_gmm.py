@@ -3,6 +3,10 @@
 import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
+import contextlib
+import io
+import subprocess
+import time
 import os
 from pathlib import Path
 import sys
@@ -402,6 +406,93 @@ class DiscoveryTests(IsolatedTest):
         with patch.object(Path, 'read_text', return_value=content):
             self.assertEqual(gmm._sshfs_mount_points(), {'/run/user/1000/a b'})
 
+
+
+class ReviewRegressionTests(IsolatedTest):
+    def test_transport_failure_invalidates_snapshot_instead_of_empty_storage(self):
+        mount = gmm.Mount('phone', 'Phone', self.root / 'mount', 'sftp://192.0.2.1:1739/')
+        for operation in ('directories', 'readable'):
+            with self.subTest(operation=operation):
+                reader = FakeReader()
+                setattr(reader, operation, lambda uri: (_ for _ in ()).throw(ConnectionResetError('connection reset')))
+                with self.assertRaisesRegex(RuntimeError, 'connection reset'):
+                    gmm.scan(self.config, [mount], reader)
+
+    def test_internal_is_tried_even_with_unusable_advertised_paths(self):
+        uri = 'sftp://192.0.2.1:1739/'
+        mount = gmm.Mount('phone', 'Phone', self.root / 'mount', uri,
+                          {'All files': '', 'Camera': 'DCIM/Camera'})
+        entries = gmm.scan(self.config, [mount], FakeReader([uri + 'storage/emulated/0']))['entries']
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['uri'], uri + 'storage/emulated/0')
+
+    def test_failed_daemon_scan_preserves_existing_artifacts(self):
+        entry = {'name': 'Phone', 'target': str(self.root / 'mount'), 'uri': 'sftp://192.0.2.1:1739/storage/emulated/0', 'label': 'Phone'}
+        artifacts = gmm.Artifacts()
+        artifacts.reconcile(self.config, [entry])
+        with patch.object(gmm, 'collect_snapshot', side_effect=RuntimeError('connection reset')), patch.object(gmm.signal, 'signal'), patch.object(gmm.time, 'sleep', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                gmm.daemon(self.config)
+        self.assertTrue((self.config.directory / 'Phone').is_symlink())
+        self.assertIn(entry['uri'], artifacts.bookmarks.read_text())
+
+    def test_status_reports_missing_artifacts_and_stopped_daemon(self):
+        entry = {'name': 'Phone', 'target': str(self.root / 'mount'), 'uri': 'sftp://192.0.2.1:1739/storage/emulated/0', 'label': 'Phone'}
+        out = io.StringIO()
+        with patch.object(gmm, 'collect_snapshot', return_value={'entries': [entry], 'notes': []}), contextlib.redirect_stdout(out):
+            self.assertEqual(gmm.report(self.config), 1)
+        self.assertIn('Daemon: not running', out.getvalue())
+        self.assertIn('missing or changed', out.getvalue())
+        self.assertIn('Missing bookmark:', out.getvalue())
+
+    def invalid_config(self):
+        self.config.path.parent.mkdir(parents=True)
+        self.config.path.write_text('version = 3\n[logging]\nlevel = "OFF"\n')
+
+    def test_doctor_continues_after_invalid_config(self):
+        self.invalid_config()
+        out = io.StringIO()
+        with patch.object(sys, 'argv', ['gmm', 'doctor']), contextlib.redirect_stdout(out), patch.object(gmm, 'collect_snapshot') as scan:
+            self.assertEqual(gmm.main(), 1)
+        self.assertIn('Configuration error: Invalid logging level', out.getvalue())
+        self.assertIn('Bookmarks:', out.getvalue())
+        scan.assert_not_called()
+
+    def test_uninstall_without_systemd_or_valid_config_cleans_owned_items(self):
+        self.invalid_config()
+        entry = {'name': 'Phone', 'target': str(self.root / 'mount'), 'uri': 'sftp://192.0.2.1:1739/storage/emulated/0', 'label': 'Phone'}
+        artifacts = gmm.Artifacts()
+        artifacts.reconcile(self.config, [entry])
+        binary = self.root / 'bin/gmm'
+        binary.parent.mkdir()
+        binary.write_text('test executable')
+        with patch.dict(os.environ, {'XDG_BIN_HOME': str(binary.parent)}), patch.object(gmm.shutil, 'which', return_value=None), patch.object(sys, 'argv', ['gmm', 'uninstall', '--yes']), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gmm.main(), 0)
+        self.assertFalse(binary.exists())
+        self.assertFalse((self.config.directory / 'Phone').is_symlink())
+        self.assertEqual(artifacts.bookmarks.read_text(), '')
+        self.assertTrue(self.config.path.exists())
+
+    def test_stop_manual_daemon_before_cleanup(self):
+        directory = gmm.state_home()
+        directory.mkdir(parents=True)
+        script = "import fcntl, os, sys, time; f=open(sys.argv[1], 'w'); fcntl.flock(f, fcntl.LOCK_EX); f.write(str(os.getpid())); f.flush(); time.sleep(60)"
+        child = subprocess.Popen([sys.executable, '-c', script, str(directory / 'daemon.lock')])
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if (directory / 'daemon.lock').exists() and (directory / 'daemon.lock').read_text():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(gmm.daemon_running())
+            with patch.object(gmm.shutil, 'which', return_value=None), gmm.stopped_daemon():
+                child.wait(timeout=2)
+                self.assertIsNotNone(child.returncode)
+            self.assertFalse(gmm.daemon_running())
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
 
 if __name__ == '__main__':
     unittest.main()

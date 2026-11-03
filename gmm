@@ -29,7 +29,7 @@ try:
 except (ImportError, ValueError):
     Gio = GLib = None
 
-__version__ = '3.0.0'
+__version__ = '3.1.0'
 DEFAULT_CONFIG = '''# GMM 3: works with existing mounts; never requests mounting.
 version = 3
 [general]
@@ -117,7 +117,10 @@ class Config:
             path, separator, label = value.rpartition(':')
             if not separator or not label.strip() or '..' in PurePosixPath(path).parts:
                 raise ValueError(f'Invalid custom storage path: {value!r}')
-        cfg.level = data.get('logging', {}).get('level', 'INFO').upper()
+        cfg.level = data.get('logging', {}).get('level', 'INFO')
+        if not isinstance(cfg.level, str):
+            raise ValueError('logging.level must be a string')
+        cfg.level = cfg.level.upper()
         if cfg.level not in ('DEBUG', 'INFO', 'WARNING', 'ERROR'):
             raise ValueError('Invalid logging level')
         return cfg
@@ -404,11 +407,24 @@ class Reader:
         return True
 
 
+def probe_failure(error):
+    """Missing/denied candidates are normal; transport failures invalidate the scan."""
+    if isinstance(error, (PermissionError, FileNotFoundError, NotADirectoryError)):
+        return
+    if GLib is not None and isinstance(error, GLib.Error):
+        if any(error.matches(Gio.io_error_quark(), code) for code in
+               (Gio.IOErrorEnum.PERMISSION_DENIED, Gio.IOErrorEnum.NOT_FOUND,
+                Gio.IOErrorEnum.NOT_DIRECTORY)):
+            return
+    raise RuntimeError(f'Storage read failed: {error}') from error
+
+
 def storage_paths(mount, config, reader):
     """Probe the known child before listing root: root enumeration may be denied."""
     candidates = dict(mount.paths)
-    if not candidates:
-        candidates['Internal'] = 'storage/emulated/0'
+    if 'storage/emulated/0' not in candidates.values():
+        label = 'Internal' if 'Internal' not in candidates else 'Internal storage'
+        candidates[label] = 'storage/emulated/0'
     for custom in config.custom_paths:
         path, _, label = custom.rpartition(':')
         candidates[label.strip()] = path.strip('/')
@@ -418,8 +434,8 @@ def storage_paths(mount, config, reader):
             if re.fullmatch(r'[0-9a-fA-F]{4}-[0-9a-fA-F]{4}', name):
                 label = 'SD card' if 'SD card' not in candidates else f'SD card {name}'
                 candidates[label] = f'storage/{name}'
-    except Exception:
-        pass  # A known child can still be accessible.
+    except Exception as error:
+        probe_failure(error)
     result, seen = {}, set()
     for label, relative in candidates.items():
         relative = str(PurePosixPath(relative.strip('/')))
@@ -431,15 +447,15 @@ def storage_paths(mount, config, reader):
             if reader.readable(child_uri(mount.uri, relative)):
                 result[display_name(label)] = relative
                 seen.add(relative)
-        except Exception:
-            pass
+        except Exception as error:
+            probe_failure(error)
     if not result:
         try:
             root_names = reader.directories(mount.uri)
             if set(root_names) & {'DCIM', 'Download', 'Documents', 'Pictures', 'Music'}:
                 result['Internal'] = ''
-        except Exception:
-            pass
+        except Exception as error:
+            probe_failure(error)
     return result
 
 
@@ -586,6 +602,10 @@ def daemon(config):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError('GMM daemon is already running')
+        lock.seek(0)
+        lock.truncate()
+        lock.write(str(os.getpid()))
+        lock.flush()
         stopping = False
         def stop(*_):
             nonlocal stopping
@@ -626,61 +646,141 @@ def daemon(config):
                 time.sleep(0.5)
 
 
-def report(config, detailed=False):
+def daemon_running():
+    path = state_home() / 'daemon.lock'
+    if not path.exists():
+        return False
+    with open(path, 'a+') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def report(config, detailed=False, config_error=None):
     print(f'GMM {__version__}')
-    print('Existing mounts only; GMM never requests mounting.')
-    failures = False
+    running = daemon_running()
+    print('Daemon: ' + ('running' if running else 'not running'))
+    failures = not running or bool(config_error)
+    artifacts = Artifacts()
     try:
-        snapshot = collect_snapshot()
+        state = artifacts.load()
+        lines = artifacts.bookmarks.read_text().splitlines() if artifacts.bookmarks.exists() else []
+        snapshot = {'entries': [], 'notes': []}
+        if config_error:
+            print(f'Configuration error: {config_error}')
+            print('Live discovery skipped until the configuration is corrected.')
+        else:
+            snapshot = collect_snapshot()
+        expected_links = dict(state['links'])
+        expected_bookmarks = set(state['bookmarks'])
         for entry in snapshot['entries']:
             print(f"{entry['label']}: {entry['uri']}")
+            if entry['target']:
+                expected_links[str(config.directory / entry['name'])] = entry['target']
+            expected_bookmarks.add(f"{entry['uri']} {entry['label']}")
+        for path, target in expected_links.items():
+            link = Path(path)
+            valid = link.is_symlink() and os.readlink(link) == target
+            print(f"Terminal link: {path}: {'present' if valid else 'missing or changed'}")
+            failures |= not valid
+        missing = expected_bookmarks - set(lines)
+        print(f'Bookmarks: {len(expected_bookmarks) - len(missing)}/{len(expected_bookmarks)} expected entries present')
+        failures |= bool(missing)
+        for line in sorted(missing):
+            print(f'Missing bookmark: {line}')
         for note in snapshot['notes']:
             print(note)
-        if not snapshot['entries']:
-            print('No usable phone storage detected. Use GSConnect/KDE Connect to mount the phone first.')
+        if not snapshot['entries'] and not config_error:
+            print('No usable phone storage detected. Check the notes above and the native mount in GSConnect/KDE Connect.')
     except Exception as exc:
-        print(f'Discovery failed: {exc}')
+        print(f'Diagnostics failed: {exc}')
         failures = True
     if detailed:
-        print(f'Config: {config.path}\nTerminal links: {config.directory}\nGTK bookmarks: {Artifacts().bookmarks}')
-        installed = read_json(state_home() / 'status.json', {})
-        stamp = installed.get('checked_at')
-        print('Last daemon scan: ' + (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stamp)) if stamp else 'none recorded'))
-        error = state_home() / 'scan-error.txt'
-        if error.exists():
-            print(error.read_text())
-        print('KDE Connect SSHFS discovery is supported; automatic sidebar entries target GTK file managers, not Dolphin Places.')
-        print('Logs can include device names, addresses and file paths. Check them before posting and remove anything you’d rather keep private.')
+        print(f'Config: {config.path}\nTerminal links: {config.directory}\nGTK bookmarks: {artifacts.bookmarks}')
+        try:
+            installed = read_json(state_home() / 'status.json', {})
+            stamp = installed.get('checked_at')
+            print('Last daemon scan: ' + (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stamp)) if stamp else 'none recorded'))
+            error = state_home() / 'scan-error.txt'
+            if error.exists():
+                print(error.read_text())
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            print(f'Saved daemon status unavailable: {exc}')
+            failures = True
+        print('Automatic sidebar entries target GTK file managers; Dolphin Places is not supported.')
     return int(failures)
 
 
 def update():
+    current_version = __version__
     url = 'https://raw.githubusercontent.com/vjaykrsna/gsconnect-mount-manager/main/install.sh'
     with urllib.request.urlopen(url, timeout=30) as response:
         data = response.read(1024 * 1024 + 1)
     if len(data) > 1024 * 1024 or not data.startswith(b'#!/'):
         raise ValueError('Unexpected installer response')
+    # Extract new version from installer header
+    new_version = 'unknown'
+    for line in data.decode().splitlines():
+        if line.startswith('# GMM '):
+            new_version = line.split('# GMM ')[1].split(' ')[0]
+            break
+    if new_version == current_version:
+        print(f'Already at latest version {current_version}')
+        return 0
     with tempfile.TemporaryDirectory(prefix='gmm-update-') as folder:
         installer = Path(folder) / 'install.sh'
         installer.write_bytes(data)
-        return subprocess.run(['bash', str(installer)]).returncode
+        rc = subprocess.run(['bash', str(installer)], capture_output=True, text=True).returncode
+    if rc == 0:
+        print(f'Updated GMM {current_version} → {new_version}')
+    return rc
+
+
+@contextlib.contextmanager
+def stopped_daemon():
+    """Stop a service or manual daemon, then hold its lock during cleanup."""
+    systemctl = shutil.which('systemctl')
+    if systemctl:
+        subprocess.run([systemctl, '--user', 'stop', 'gmm.service'], capture_output=True)
+    state_home().mkdir(parents=True, exist_ok=True)
+    with open(state_home() / 'daemon.lock', 'a+') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.seek(0)
+            pid = lock.read().strip()
+            if not pid.isdigit() or int(pid) <= 1 or int(pid) == os.getpid():
+                raise RuntimeError('Stop the manually started GMM daemon before uninstalling.')
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid), signal.SIGTERM)
+            deadline = time.monotonic() + 20
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('GMM did not stop; uninstall aborted. Stop the daemon and retry.')
+                    time.sleep(0.1)
+        yield systemctl
 
 
 def uninstall(config, yes=False, purge=False):
     if not yes and input('Remove GMM and its links and bookmarks? [y/N] ').lower() not in ('y', 'yes'):
         return 0
-    result = subprocess.run(['systemctl', '--user', 'stop', 'gmm.service'], capture_output=True, text=True)
-    active = subprocess.run(['systemctl', '--user', 'is-active', '--quiet', 'gmm.service']).returncode == 0
-    if active:
-        raise RuntimeError('Could not stop GMM; aborting uninstall')
-    Artifacts().reconcile(config, [])
-    subprocess.run(['systemctl', '--user', 'disable', 'gmm.service'], capture_output=True)
-    (config_home() / 'systemd/user/gmm.service').unlink(missing_ok=True)
-    subprocess.run(['systemctl', '--user', 'daemon-reload'], capture_output=True)
-    binary = Path(os.environ.get('XDG_BIN_HOME') or Path.home() / '.local/bin') / 'gmm'
-    binary.unlink(missing_ok=True)
-    if purge:
-        config.path.unlink(missing_ok=True)  # Preserve backups, including conflicting user items.
+    with stopped_daemon() as systemctl:
+        Artifacts().reconcile(config, [])
+        if systemctl:
+            subprocess.run([systemctl, '--user', 'disable', 'gmm.service'], capture_output=True)
+        (config_home() / 'systemd/user/gmm.service').unlink(missing_ok=True)
+        if systemctl:
+            subprocess.run([systemctl, '--user', 'daemon-reload'], capture_output=True)
+        binary = Path(os.environ.get('XDG_BIN_HOME') or Path.home() / '.local/bin') / 'gmm'
+        binary.unlink(missing_ok=True)
+        if purge:
+            config.path.unlink(missing_ok=True)
     print('GMM removed. Native phone mounts and saved backups are preserved.')
     return 0
 
@@ -700,7 +800,13 @@ def main():
             return 0
         if args.command == 'update' and not args.scan:
             return update()
-        config = Config.load()
+        config_error = None
+        try:
+            config = Config.load()
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            if args.scan or args.command not in ('uninstall', 'status', 'doctor'):
+                raise
+            config, config_error = Config(), str(exc)
         logging.basicConfig(level=config.level, format='%(levelname)s: %(message)s')
         if args.scan:
             if Gio is None:
@@ -709,7 +815,7 @@ def main():
         elif args.command == 'daemon':
             daemon(config)
         elif args.command in ('status', 'doctor'):
-            return report(config, args.command == 'doctor')
+            return report(config, args.command == 'doctor', config_error)
         elif args.command == 'uninstall':
             return uninstall(config, args.yes, args.purge)
         return 0

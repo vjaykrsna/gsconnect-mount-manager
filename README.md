@@ -19,7 +19,7 @@ Terminal links are created directly inside `~/Devices`:
 ~/Devices/Phone_SD_card  -> SD card
 ```
 
-GMM updates its entries when storage changes and removes them when the mount disappears. An existing local item that conflicts with a link is backed up before replacement. GMM never deletes the contents of that item to make room for a link.
+GMM updates its entries when storage changes and removes them when the mount disappears. A connection or read error preserves the previous entries until discovery succeeds. An existing local item that conflicts with a link is backed up before replacement. GMM never deletes the contents of that item to make room for a link.
 
 The file manager's native network mount may remain visible alongside GMM's entry. GMM does not hide or modify that native entry.
 
@@ -56,7 +56,7 @@ Update runs the same installer. It downloads from the repository's `main` branch
 ## Commands
 
 ```bash
-gmm status       # Current phone storage and GMM entries
+gmm status       # Discover storage and verify daemon, links and bookmarks
 gmm doctor       # Diagnose why storage access is unavailable
 gmm --version
 gmm update
@@ -101,11 +101,13 @@ GMM respects `XDG_CONFIG_HOME` and `XDG_BIN_HOME` for its configuration and inst
 
 **3.0 is a breaking change.** On the first upgrade, the old configuration is saved with a dated backup and replaced with the new defaults. This resets custom paths, notification preferences, bookmark modes and other old settings. The installer reports the backup; reapply supported preferences using the configuration above. Later updates within the new configuration format preserve your settings.
 
-The new defaults create direct sidebar entries and flat terminal links, enable notifications, and never request mounts. Old GMM-owned entries are migrated only when their ownership can be established. Untracked files and bookmarks are left alone.
+The new defaults create direct sidebar entries and flat terminal links, enable notifications, and never request mounts. Old GMM-owned entries are migrated only when their ownership can be established. Unrelated bookmarks are preserved. If a local item conflicts with a new terminal link, GMM renames it to a dated backup before creating the link.
 
 The `list`, `mount`, `unmount`, `clean` and `config` commands have been removed. Use `status` for an overview, GSConnect/KDE Connect for mounting, and edit the config file for settings. Cleanup happens as part of storage reconciliation and uninstall.
 
 ## Troubleshooting
+
+`gmm status` and `gmm doctor` check whether the daemon is running and whether expected bookmarks and terminal links exist. They return a nonzero exit code when these checks fail. If the config is invalid, diagnostics report the error and inspect saved entries; live discovery waits until the config is corrected. Uninstall can still remove tracked entries with an invalid config, including when GMM was started manually without systemd.
 
 Start with `gmm doctor`. The important distinction is whether the phone has no native mount, has a mount but no accessible storage path, or has accessible storage but no GMM entry.
 
@@ -120,4 +122,4 @@ python3 -m unittest discover -s tests
 bash -n install.sh
 ```
 
-Tests cover logic and failure handling. They do not replace testing the native mount and actual file manager on each supported desktop. See [storage research](GMM-STORAGE-RESEARCH.md) for the evidence and limitations behind this design.
+Tests cover logic and failure handling. They do not replace testing the native mount and actual file manager on each supported desktop.

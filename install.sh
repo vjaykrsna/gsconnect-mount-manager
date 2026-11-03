@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GMM 3.0.0 — installs the same executable used by `gmm update`.
+# GMM 3.1.0 — installs the same executable used by `gmm update`.
 set -euo pipefail
 
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
